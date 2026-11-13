@@ -88,11 +88,22 @@ final class StreamConnection: @unchecked Sendable {
 
             var message = Data()
             if let parameterSets = frame.parameterSets {
+                message.append(WireProtocol.message(.codec, payload: Data([frame.codec.rawValue])))
                 message.append(WireProtocol.message(.config, payload: parameterSets))
             }
             message.append(WireProtocol.frameMessage(ptsMicros: frame.ptsMicros, isKeyframe: frame.isKeyframe,
                                                      annexB: frame.annexB))
             write(message)
+        }
+    }
+
+    /// Interleaved signed 16-bit little-endian PCM.
+    func sendAudio(pcm: Data, ptsMicros: UInt64, sampleRate: UInt32, channels: UInt8) {
+        queue.async { [self] in
+            // Audio is small; when the network is that congested, skipping it beats adding delay.
+            guard isReady, bytesInFlight <= maxBytesInFlight else { return }
+            write(WireProtocol.audioMessage(ptsMicros: ptsMicros, sampleRate: sampleRate, channels: channels,
+                                            pcm: pcm))
         }
     }
 

@@ -25,6 +25,7 @@ targets:
           - UIInterfaceOrientationPortrait
         UIApplicationSupportsIndirectInputEvents: true
         NSCameraUsageDescription: "Камера передаёт видео в OBS на вашем компьютере."
+        NSMicrophoneUsageDescription: "Микрофон передаёт звук в OBS, если вы включили звук в настройках."
         NSLocalNetworkUsageDescription: "Нужно, чтобы найти OBS в локальной сети и отправлять в него видео."
         NSBonjourServices:
           - _obsiphonecam._tcp
