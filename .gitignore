@@ -1,0 +1,11 @@
+.DS_Store
+
+# OBS plugin
+obs-plugin/build/
+obs-plugin/.deps/
+
+# iOS app
+ios-app/build/
+ios-app/OBSCamera.xcodeproj/
+xcuserdata/
+DerivedData/

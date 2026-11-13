@@ -1,0 +1,36 @@
+name: OBSCamera
+options:
+  bundleIdPrefix: com.obscamera
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  OBSCamera:
+    type: application
+    platform: iOS
+    sources:
+      - OBSCamera
+    info:
+      path: OBSCamera/Info.plist
+      properties:
+        CFBundleDisplayName: OBS Camera
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIApplicationSupportsIndirectInputEvents: true
+        NSCameraUsageDescription: "Камера передаёт видео в OBS на вашем компьютере."
+        NSLocalNetworkUsageDescription: "Нужно, чтобы найти OBS в локальной сети и отправлять в него видео."
+        NSBonjourServices:
+          - _obsiphonecam._tcp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.obscamera.app
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_PREVIEWS: YES
