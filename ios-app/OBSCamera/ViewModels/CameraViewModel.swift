@@ -21,6 +21,13 @@ final class CameraViewModel: ObservableObject {
     @Published var manualAddress: String {
         didSet { UserDefaults.standard.set(manualAddress, forKey: Self.manualAddressKey) }
     }
+    @Published var connectionMode: ConnectionMode {
+        didSet {
+            guard connectionMode != oldValue else { return }
+            connectionMode.save()
+            applyConnectionMode()
+        }
+    }
 
     let engine = StreamingEngine()
     private let browser = HostBrowser()
@@ -32,6 +39,7 @@ final class CameraViewModel: ObservableObject {
     init() {
         settings = StreamSettings.load()
         manualAddress = UserDefaults.standard.string(forKey: Self.manualAddressKey) ?? ""
+        connectionMode = ConnectionMode.load()
 
         engine.statusHandler = { [weak self] status in
             Task { @MainActor in self?.handle(status) }
@@ -56,13 +64,14 @@ final class CameraViewModel: ObservableObject {
     var isConnectedOrConnecting: Bool {
         switch status {
         case .connecting, .streaming: true
-        case .idle, .failed: false
+        case .idle, .waitingForUSB, .failed: false
         }
     }
 
     var statusText: String {
         switch status {
         case .idle: "Не подключено"
+        case .waitingForUSB: "Ожидание OBS по кабелю…"
         case .connecting(let host): "Подключение к \(host)…"
         case .streaming(let host): "В эфире: \(host)"
         case .failed(let reason): "Ошибка: \(Self.friendlyError(reason))"
@@ -84,9 +93,9 @@ final class CameraViewModel: ObservableObject {
     func onAppear() async {
         guard !didStart else { return }
         didStart = true
-        browser.start()
         await requestCameraAccessIfNeeded()
         engine.startCapture(with: settings)
+        applyConnectionMode()
     }
 
     func connect(to host: OBSHost) {
@@ -117,7 +126,7 @@ final class CameraViewModel: ObservableObject {
         switch phase {
         case .active:
             engine.startCapture(with: settings)
-            browser.start()
+            if connectionMode == .wifi { browser.start() }
         case .background:
             // The camera is unavailable in the background; the connection
             // stays open (keep-alive pings) and resumes on return.
@@ -166,6 +175,22 @@ final class CameraViewModel: ObservableObject {
             return "Компьютер недоступен. Проверьте, что iPhone и компьютер в одной сети."
         }
         return reason
+    }
+
+    private func applyConnectionMode() {
+        guard didStart else { return }
+        lastHost = nil
+        reconnectTask?.cancel()
+        reconnectError = nil
+        switch connectionMode {
+        case .wifi:
+            engine.stopUSBMode()
+            browser.start()
+        case .usb:
+            browser.stop()
+            hosts = []
+            engine.startUSBMode(deviceName: UIDevice.current.name)
+        }
     }
 
     private func applySettings() {

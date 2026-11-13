@@ -7,6 +7,7 @@ import os
 final class StreamingEngine: @unchecked Sendable {
     enum Status: Equatable {
         case idle
+        case waitingForUSB
         case connecting(host: String)
         case streaming(host: String)
         case failed(String)
@@ -23,12 +24,16 @@ final class StreamingEngine: @unchecked Sendable {
     let camera = CameraCaptureService()
     private let testPattern = TestPatternSource()
     private let encoder = H264Encoder()
+    private let usbListener = USBListener()
     private let logger = Logger(subsystem: "com.obscamera.app", category: "Engine")
+    private static let usbHostName = "OBS (USB)"
 
     private let lock = NSLock()
     private var activeSource: VideoFrameSource?
     private var connection: StreamConnection?
     private var isStreaming = false
+    private var usbMode = false
+    private var usbDeviceName = ""
     private var settings = StreamSettings()
     private var framesSent = 0
     private var bytesSent = 0
@@ -54,6 +59,9 @@ final class StreamingEngine: @unchecked Sendable {
         }
         camera.frameHandler = frameHandler
         testPattern.frameHandler = frameHandler
+        usbListener.connectionHandler = { [weak self] connection in
+            self?.attachUSB(connection)
+        }
     }
 
     /// The source actually used (camera falls back to the test pattern when
@@ -89,29 +97,29 @@ final class StreamingEngine: @unchecked Sendable {
         source?.stop()
     }
 
+    /// Wi‑Fi: connects to OBS.
     func connect(to host: OBSHost, deviceName: String) {
         disconnect()
+        start(StreamConnection(endpoint: host.endpoint, deviceName: deviceName), hostName: host.name)
+    }
 
-        let connection = StreamConnection(endpoint: host.endpoint, deviceName: deviceName)
-        connection.keyframeNeededHandler = { [weak self] in self?.encoder.requestKeyframe() }
-        connection.bytesSentHandler = { [weak self] bytes in
-            guard let self else { return }
-            self.lock.lock()
-            self.bytesSent += bytes
-            self.lock.unlock()
-        }
-        connection.stateHandler = { [weak self, weak connection] state in
-            guard let self, let connection else { return }
-            self.handle(state, of: connection, host: host)
-        }
-
+    /// USB: waits for OBS to connect through the cable.
+    func startUSBMode(deviceName: String) {
+        disconnect()
         lock.lock()
-        self.connection = connection
+        usbMode = true
+        usbDeviceName = deviceName
         lock.unlock()
+        usbListener.start()
+        publish(.waitingForUSB)
+    }
 
-        publish(.connecting(host: host.name))
-        connection.start()
-        startStatsTimer()
+    func stopUSBMode() {
+        lock.lock()
+        usbMode = false
+        lock.unlock()
+        usbListener.stop()
+        disconnect()
     }
 
     func disconnect() {
@@ -124,12 +132,55 @@ final class StreamingEngine: @unchecked Sendable {
         connection?.cancel()
         encoder.invalidate()
         stopStatsTimer()
-        publish(.idle)
+        lock.lock()
+        let usbMode = self.usbMode
+        lock.unlock()
+        publish(usbMode ? .waitingForUSB : .idle)
     }
 
     // MARK: - Private
 
-    private func handle(_ state: StreamConnection.State, of connection: StreamConnection, host: OBSHost) {
+    private func attachUSB(_ nwConnection: NWConnection) {
+        lock.lock()
+        let isUSBMode = usbMode
+        let deviceName = usbDeviceName
+        let previous = connection
+        connection = nil
+        isStreaming = false
+        lock.unlock()
+
+        guard isUSBMode else {
+            nwConnection.cancel()
+            return
+        }
+        // A new connection replaces a stale one (e.g. OBS restarted the source).
+        previous?.cancel()
+        start(StreamConnection(connection: nwConnection, deviceName: deviceName), hostName: Self.usbHostName)
+    }
+
+    private func start(_ connection: StreamConnection, hostName: String) {
+        connection.keyframeNeededHandler = { [weak self] in self?.encoder.requestKeyframe() }
+        connection.bytesSentHandler = { [weak self] bytes in
+            guard let self else { return }
+            self.lock.lock()
+            self.bytesSent += bytes
+            self.lock.unlock()
+        }
+        connection.stateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            self.handle(state, of: connection, hostName: hostName)
+        }
+
+        lock.lock()
+        self.connection = connection
+        lock.unlock()
+
+        publish(.connecting(host: hostName))
+        connection.start()
+        startStatsTimer()
+    }
+
+    private func handle(_ state: StreamConnection.State, of connection: StreamConnection, hostName: String) {
         lock.lock()
         let isCurrent = self.connection === connection
         lock.unlock()
@@ -137,24 +188,26 @@ final class StreamingEngine: @unchecked Sendable {
 
         switch state {
         case .connecting:
-            publish(.connecting(host: host.name))
+            publish(.connecting(host: hostName))
         case .waiting(let reason):
-            logger.warning("Waiting for \(host.name, privacy: .public): \(reason, privacy: .public)")
-            publish(.connecting(host: host.name))
+            logger.warning("Waiting for \(hostName, privacy: .public): \(reason, privacy: .public)")
+            publish(.connecting(host: hostName))
         case .ready:
             lock.lock()
             isStreaming = true
             lock.unlock()
             encoder.requestKeyframe()
-            publish(.streaming(host: host.name))
+            publish(.streaming(host: hostName))
         case .failed(let reason):
             lock.lock()
             isStreaming = false
             self.connection = nil
+            let usbMode = self.usbMode
             lock.unlock()
             connection.cancel()
             stopStatsTimer()
-            publish(.failed(reason))
+            // Over USB, OBS reconnects by itself; just wait for it.
+            publish(usbMode ? .waitingForUSB : .failed(reason))
         case .closed:
             break
         }

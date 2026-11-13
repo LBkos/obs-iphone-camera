@@ -44,7 +44,14 @@ struct ContentView: View {
 
     private var controlPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if viewModel.isConnectedOrConnecting {
+            Picker("Подключение", selection: $viewModel.connectionMode) {
+                ForEach(ConnectionMode.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
+
+            if viewModel.connectionMode == .usb {
+                usbInstructions
+            } else if viewModel.isConnectedOrConnecting {
                 Button(role: .destructive, action: viewModel.disconnect) {
                     Label("Отключиться", systemImage: "stop.circle.fill")
                         .frame(maxWidth: .infinity)
@@ -78,6 +85,27 @@ struct ContentView: View {
         }
         .padding()
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var usbInstructions: some View {
+        if case .streaming = viewModel.status {
+            Label("Видео идёт по кабелю. Чтобы остановить, переключитесь на Wi‑Fi.", systemImage: "cable.connector")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        } else {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "cable.connector")
+                    .font(.title2)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Подключите iPhone кабелем к компьютеру")
+                        .font(.headline)
+                    Text("В OBS откройте свойства источника «iPhone Camera» и выберите подключение «USB-кабель». Если iPhone спросит, нажмите «Доверять».")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -141,7 +169,7 @@ private struct StatusBadge: View {
     private var color: Color {
         switch status {
         case .idle: .gray
-        case .connecting: .orange
+        case .waitingForUSB, .connecting: .orange
         case .streaming: .red
         case .failed: .yellow
         }

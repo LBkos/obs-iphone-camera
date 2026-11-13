@@ -4,18 +4,23 @@
 
 | Часть | Папка | Что делает |
 |---|---|---|
-| iOS-приложение | [ios-app](ios-app) | Снимает камерой, кодирует в H.264 (аппаратно, VideoToolbox) и отправляет по Wi‑Fi |
+| iOS-приложение | [ios-app](ios-app) | Снимает камерой, кодирует в H.264 (аппаратно, VideoToolbox) и отправляет по Wi‑Fi или USB-кабелю |
 | Плагин OBS | [obs-plugin](obs-plugin) | Добавляет источник **iPhone Camera**: принимает поток, декодирует через FFmpeg и выводит в OBS |
 
 ```
-iPhone ── камера → H.264 (VideoToolbox) → TCP ──Wi‑Fi──▶ OBS (Linux)
-                                                      плагин: TCP-сервер :47100
-                                                      → FFmpeg (libavcodec) → кадр в OBS
-   NWBrowser ◀──────── Bonjour/mDNS «_obsiphonecam._tcp» ──── Avahi
+Wi‑Fi:  iPhone ── H.264 → TCP ──────────────────────────▶ плагин: TCP-сервер :47100
+        NWBrowser ◀── Bonjour/mDNS «_obsiphonecam._tcp» ── Avahi
+
+USB:    iPhone: слушает 127.0.0.1:47101 ◀── кабель ── usbmuxd ◀── плагин подключается
 ```
 
-- Плагин открывает TCP-порт (по умолчанию **47100**) и объявляет себя через Bonjour (Avahi).
+Два режима подключения, переключаются и в приложении, и в свойствах источника OBS:
+
+- **Wi‑Fi.** Плагин открывает TCP-порт (по умолчанию **47100**) и объявляет себя через Bonjour (Avahi).
   iPhone находит компьютер сам. Если mDNS недоступен, IP-адрес вводится вручную.
+- **USB-кабель.** iPhone не может сам подключиться к компьютеру по кабелю, поэтому направление
+  обратное: приложение слушает порт **47101** (только loopback, через Wi‑Fi он не виден), а плагин
+  раз в секунду подключается к нему через `usbmuxd`. Работает без сети, задержка и стабильность лучше.
 - Задержка минимальная: без B-кадров, OBS выводит кадры без буферизации, при перегрузке
   сети iPhone пропускает кадры до следующего ключевого, а не копит очередь.
 - Если соединение оборвалось (перезапуск OBS, сбой Wi‑Fi), приложение переподключается само.
@@ -26,21 +31,24 @@ iPhone ── камера → H.264 (VideoToolbox) → TCP ──Wi‑Fi──�
 
 Ubuntu / Debian:
 ```bash
-sudo apt install build-essential cmake pkg-config libavcodec-dev libavutil-dev libavahi-compat-libdnssd-dev libobs-dev
+sudo apt install build-essential cmake pkg-config libavcodec-dev libavutil-dev libavahi-compat-libdnssd-dev libusbmuxd-dev usbmuxd libobs-dev
 ```
 
 Fedora:
 ```bash
-sudo dnf install gcc cmake pkgconf-pkg-config ffmpeg-free-devel avahi-compat-libdns_sd-devel obs-studio-devel
+sudo dnf install gcc cmake pkgconf-pkg-config ffmpeg-free-devel avahi-compat-libdns_sd-devel libusbmuxd-devel usbmuxd obs-studio-devel
 ```
 
 Arch:
 ```bash
-sudo pacman -S base-devel cmake ffmpeg avahi obs-studio
+sudo pacman -S base-devel cmake ffmpeg avahi libusbmuxd usbmuxd obs-studio
 ```
 
 Если пакета разработки OBS (`libobs-dev` / `obs-studio-devel`) нет, скрипт установки сам скачает
 заголовки libobs нужной версии. На ARM дополнительно нужен `libsimde-dev`.
+
+`libusbmuxd` (версии 2.0+) и служба `usbmuxd` нужны только для подключения по кабелю. Без них
+плагин соберётся, но режим USB покажет, что он недоступен.
 
 ### 2. Сборка и установка (для текущего пользователя)
 
@@ -68,6 +76,18 @@ cmake --build build -j && cmake --install build
   ```
   (для firewalld: `sudo firewall-cmd --permanent --add-port=47100/tcp --add-service=mdns && sudo firewall-cmd --reload`).
 
+### 4. USB-кабель
+
+1. В приложении на iPhone выберите **USB-кабель**.
+2. Подключите iPhone к компьютеру. При первом подключении iPhone спросит «Доверять этому компьютеру?»:
+   нажмите **Доверять** и введите код-пароль.
+3. В OBS в свойствах источника выберите **Подключение → USB-кабель**. Если подключено несколько
+   iPhone, выберите нужный в списке **iPhone** (по UDID).
+
+Проверить, что Linux видит телефон: `systemctl status usbmuxd` (служба запускается сама при
+подключении iPhone) и `idevice_id -l` из пакета `libimobiledevice-utils`. Файрвол для USB настраивать
+не нужно.
+
 ### OBS из Flatpak
 
 Flatpak-версия OBS работает в песочнице со своими библиотеками, поэтому плагин, собранный
@@ -78,9 +98,12 @@ SDK `org.kde.Sdk` той же версии, что у OBS, и класть в
 
 ### Свойства источника
 
-- **Статус**: ожидание или подключённое устройство, разрешение, fps. Если iPhone не подключён,
-  здесь же показаны IP-адреса компьютера для ручного ввода. Обновляется кнопкой «Обновить статус».
-- **Порт**: для нескольких iPhone добавьте несколько источников с разными портами.
+- **Статус**: ожидание или подключённое устройство, разрешение, fps. В режиме Wi‑Fi здесь же
+  показаны IP-адреса компьютера для ручного ввода; в режиме USB — что мешает подключиться
+  (нет `usbmuxd`, iPhone не подключён, приложение не в режиме USB). Обновляется кнопкой «Обновить статус».
+- **Подключение**: Wi‑Fi или USB-кабель.
+- **Порт** (Wi‑Fi): для нескольких iPhone добавьте несколько источников с разными портами.
+- **iPhone** (USB): первый подключённый кабелем или конкретный по UDID.
 - **Оставлять последний кадр**: что показывать при отключении телефона.
 
 ## iOS-приложение
@@ -97,11 +120,12 @@ cd ios-app && xcodegen generate && open OBSCamera.xcodeproj
 При первом запуске iOS попросит доступ к камере и к **локальной сети**; разрешите оба.
 
 Архитектура (MVVM, SwiftUI):
-- `Views/`: `ContentView` (превью, список компьютеров, ручной IP), `SettingsView`, `CameraPreviewView`
-- `ViewModels/CameraViewModel`: состояние экрана, автопереподключение
+- `Views/`: `ContentView` (превью, режим Wi‑Fi/USB, список компьютеров, ручной IP), `SettingsView`, `CameraPreviewView`
+- `ViewModels/CameraViewModel`: состояние экрана, режим подключения, автопереподключение
 - `Services/`: `CameraCaptureService` (AVFoundation), `TestPatternSource`, `H264Encoder` (VideoToolbox),
-  `StreamConnection` (Network.framework, TCP), `HostBrowser` (Bonjour), `StreamingEngine` (связывает всё вместе)
-- `Models/`: настройки, протокол, модель хоста
+  `StreamConnection` (Network.framework, TCP), `HostBrowser` (Bonjour), `USBListener` (порт для USB),
+  `StreamingEngine` (связывает всё вместе)
+- `Models/`: настройки, режим подключения, протокол, модель хоста
 
 Настройки: основная/фронтальная камера или тестовая картинка, 720p/1080p, 24/30/60 fps,
 битрейт 2–30 Мбит/с, горизонтальная/вертикальная ориентация. В симуляторе камеры нет,
@@ -113,14 +137,17 @@ cd ios-app && xcodegen generate && open OBSCamera.xcodeproj
 
 ```bash
 cd obs-plugin && cmake -S . -B build -DBUILD_PLUGIN=OFF && cmake --build build
-./build/obscam-receiver-test --snapshot frame.ppm
+./build/obscam-receiver-test --snapshot frame.ppm      # Wi‑Fi: ждёт iPhone, объявляет себя через Bonjour
+./build/obscam-receiver-test --usb                     # USB: подключается к iPhone через usbmuxd
+./build/obscam-receiver-test --connect 127.0.0.1:47101 # USB-режим приложения в симуляторе
 ```
 
-Он печатает fps и разрешение, объявляет себя через Bonjour и сохраняет кадр в файл.
+Он печатает fps и разрешение и может сохранить кадр в файл.
 
 ## Протокол
 
-TCP, сообщения вида `[тип: u8][длина: u32 BE][данные]`:
+Одно TCP-соединение, данные идут от iPhone к OBS в обоих режимах; отличается только то, кто
+открывает соединение. Сообщения вида `[тип: u8][длина: u32 BE][данные]`:
 
 | Тип | Данные |
 |---|---|
@@ -135,6 +162,5 @@ TCP, сообщения вида `[тип: u8][длина: u32 BE][данные]
 ## Ограничения
 
 - Только видео, без звука.
-- Только Wi‑Fi (USB пока нет).
 - iOS не даёт снимать камерой, пока приложение в фоне: держите его открытым
   (экран не гаснет, пока идёт трансляция).

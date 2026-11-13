@@ -1,7 +1,9 @@
 /*
  * Wire protocol shared by the iOS app (sender) and the OBS plugin (receiver).
  *
- * Transport: one TCP connection, iPhone -> OBS.
+ * Transport: one TCP connection carrying iPhone -> OBS data.
+ *   Wi-Fi: OBS listens (OBSCAM_DEFAULT_PORT), the iPhone connects.
+ *   USB:   the iPhone listens (OBSCAM_USB_DEVICE_PORT), OBS connects via usbmuxd.
  * Every message:  [type: u8][length: u32 big-endian][payload: length bytes]
  *
  *   HELLO  (0x01)  payload: UTF-8 device name
@@ -17,6 +19,8 @@
 #include <stdint.h>
 
 #define OBSCAM_DEFAULT_PORT 47100
+/* Port the iOS app listens on (device loopback) in USB mode, reached via usbmuxd. */
+#define OBSCAM_USB_DEVICE_PORT 47101
 #define OBSCAM_SERVICE_TYPE "_obsiphonecam._tcp"
 
 #define OBSCAM_MSG_HELLO 0x01

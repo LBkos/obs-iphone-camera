@@ -18,12 +18,23 @@
 #include <unistd.h>
 
 #define CLIENT_TIMEOUT_MS 5000
+#define RECONNECT_INTERVAL_MS 1000
 #define READ_CHUNK (256 * 1024)
 
 struct obscam_receiver {
 	struct obscam_receiver_callbacks cb;
 	uint16_t port;
 	char *service_name;
+
+	/* client mode (USB) */
+	bool client_mode;
+	obscam_connect_fn connect_fn;
+	void *connect_ctx;
+	void (*free_ctx)(void *);
+	uint64_t next_attempt_ms;
+
+	pthread_mutex_t status_mutex;
+	enum obscam_client_status status;
 
 	pthread_t thread;
 	int wake_pipe[2];
@@ -114,6 +125,36 @@ static int open_listen_socket(struct obscam_receiver *r)
 	return fd;
 }
 
+static const char *client_status_name(enum obscam_client_status status)
+{
+	switch (status) {
+	case OBSCAM_CLIENT_CONNECTING:
+		return "connecting";
+	case OBSCAM_CLIENT_CONNECTED:
+		return "connected";
+	case OBSCAM_CLIENT_UNAVAILABLE:
+		return "USB support not compiled in (libusbmuxd missing)";
+	case OBSCAM_CLIENT_NO_DAEMON:
+		return "usbmuxd is not running";
+	case OBSCAM_CLIENT_NO_DEVICE:
+		return "no iPhone connected by USB";
+	case OBSCAM_CLIENT_NO_APP:
+		return "iPhone found, waiting for the app in USB mode";
+	}
+	return "?";
+}
+
+static void set_status(struct obscam_receiver *r, enum obscam_client_status status)
+{
+	pthread_mutex_lock(&r->status_mutex);
+	enum obscam_client_status old = r->status;
+	r->status = status;
+	pthread_mutex_unlock(&r->status_mutex);
+	/* Log only changes, the connect loop retries every second. */
+	if (r->client_mode && old != status && status != OBSCAM_CLIENT_CONNECTED)
+		rlog(r, status == OBSCAM_CLIENT_UNAVAILABLE ? 2 : 0, "USB: %s", client_status_name(status));
+}
+
 static void drop_client(struct obscam_receiver *r, const char *reason)
 {
 	if (r->client_fd < 0)
@@ -122,8 +163,38 @@ static void drop_client(struct obscam_receiver *r, const char *reason)
 	close(r->client_fd);
 	r->client_fd = -1;
 	r->buf_len = 0;
+	r->next_attempt_ms = now_ms() + RECONNECT_INTERVAL_MS;
+	set_status(r, OBSCAM_CLIENT_CONNECTING);
 	if (r->cb.disconnected)
 		r->cb.disconnected(r->cb.ctx);
+}
+
+static void attach_client(struct obscam_receiver *r, int fd, const char *peer)
+{
+	int rcvbuf = 4 * 1024 * 1024;
+	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+	r->client_fd = fd;
+	r->buf_len = 0;
+	r->last_rx_ms = now_ms();
+	set_status(r, OBSCAM_CLIENT_CONNECTED);
+	rlog(r, 0, "iPhone connected via %s", peer);
+	if (r->cb.connected)
+		r->cb.connected(r->cb.ctx, peer);
+}
+
+static void try_connect(struct obscam_receiver *r)
+{
+	char peer[128] = "USB";
+	enum obscam_client_status status = OBSCAM_CLIENT_CONNECTING;
+	int fd = r->connect_fn(r->connect_ctx, peer, sizeof(peer), &status);
+	if (fd < 0) {
+		set_status(r, status);
+		r->next_attempt_ms = now_ms() + RECONNECT_INTERVAL_MS;
+		return;
+	}
+	set_cloexec(fd);
+	attach_client(r, fd, peer);
 }
 
 static void accept_client(struct obscam_receiver *r)
@@ -150,16 +221,7 @@ static void accept_client(struct obscam_receiver *r)
 	} else if (addr.ss_family == AF_INET) {
 		inet_ntop(AF_INET, &((struct sockaddr_in *)&addr)->sin_addr, peer, sizeof(peer));
 	}
-
-	int rcvbuf = 4 * 1024 * 1024;
-	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
-	r->client_fd = fd;
-	r->buf_len = 0;
-	r->last_rx_ms = now_ms();
-	rlog(r, 0, "iPhone connected from %s", peer);
-	if (r->cb.connected)
-		r->cb.connected(r->cb.ctx, peer);
+	attach_client(r, fd, peer);
 }
 
 /* Returns false on a protocol error (caller drops the client). */
@@ -251,19 +313,36 @@ static void read_client(struct obscam_receiver *r)
 static void *receiver_thread(void *arg)
 {
 	struct obscam_receiver *r = arg;
-	obscam_discovery_t *discovery = obscam_discovery_register(r->service_name, r->port);
-	if (discovery)
-		rlog(r, 0, "advertising %s via Bonjour on port %u", OBSCAM_SERVICE_TYPE, r->port);
-	else
-		rlog(r, 1, "Bonjour advertisement unavailable; enter this computer's IP in the app (port %u)",
-		     r->port);
+	obscam_discovery_t *discovery = NULL;
+	if (!r->client_mode) {
+		discovery = obscam_discovery_register(r->service_name, r->port);
+		if (discovery)
+			rlog(r, 0, "advertising %s via Bonjour on port %u", OBSCAM_SERVICE_TYPE, r->port);
+		else
+			rlog(r, 1, "Bonjour advertisement unavailable; enter this computer's IP in the app (port %u)",
+			     r->port);
+	}
 
 	for (;;) {
+		int timeout_ms = 1000;
+		if (r->client_mode && r->client_fd < 0) {
+			uint64_t now = now_ms();
+			if (now >= r->next_attempt_ms)
+				try_connect(r);
+			if (r->client_fd < 0) {
+				now = now_ms();
+				timeout_ms = r->next_attempt_ms > now ? (int)(r->next_attempt_ms - now) : 0;
+			}
+		}
+
 		struct pollfd fds[4];
 		int nfds = 0;
 		fds[nfds++] = (struct pollfd){.fd = r->wake_pipe[0], .events = POLLIN};
-		int listen_idx = nfds;
-		fds[nfds++] = (struct pollfd){.fd = r->listen_fd, .events = POLLIN};
+		int listen_idx = -1;
+		if (r->listen_fd >= 0) {
+			listen_idx = nfds;
+			fds[nfds++] = (struct pollfd){.fd = r->listen_fd, .events = POLLIN};
+		}
 		int client_idx = -1;
 		if (r->client_fd >= 0) {
 			client_idx = nfds;
@@ -276,7 +355,7 @@ static void *receiver_thread(void *arg)
 			fds[nfds++] = (struct pollfd){.fd = dnssd_fd, .events = POLLIN};
 		}
 
-		int rc = poll(fds, (nfds_t)nfds, 1000);
+		int rc = poll(fds, (nfds_t)nfds, timeout_ms);
 		if (rc < 0) {
 			if (errno == EINTR)
 				continue;
@@ -286,7 +365,7 @@ static void *receiver_thread(void *arg)
 
 		if (fds[0].revents)
 			break; /* stop requested */
-		if (fds[listen_idx].revents & POLLIN)
+		if (listen_idx >= 0 && (fds[listen_idx].revents & POLLIN))
 			accept_client(r);
 		if (client_idx >= 0 && r->client_fd == fds[client_idx].fd &&
 		    (fds[client_idx].revents & (POLLIN | POLLHUP | POLLERR)))
@@ -303,45 +382,99 @@ static void *receiver_thread(void *arg)
 	return NULL;
 }
 
-obscam_receiver_t *obscam_receiver_start(uint16_t port, const char *service_name,
-					 const struct obscam_receiver_callbacks *callbacks)
+static void receiver_free(struct obscam_receiver *r)
+{
+	if (r->listen_fd >= 0)
+		close(r->listen_fd);
+	if (r->wake_pipe[0] >= 0)
+		close(r->wake_pipe[0]);
+	if (r->wake_pipe[1] >= 0)
+		close(r->wake_pipe[1]);
+	if (r->free_ctx && r->connect_ctx)
+		r->free_ctx(r->connect_ctx);
+	pthread_mutex_destroy(&r->status_mutex);
+	free(r->buf);
+	free(r->service_name);
+	free(r);
+}
+
+static struct obscam_receiver *receiver_alloc(const struct obscam_receiver_callbacks *callbacks)
 {
 	struct obscam_receiver *r = calloc(1, sizeof(*r));
 	if (!r)
 		return NULL;
 	r->cb = *callbacks;
-	r->port = port;
-	r->service_name = service_name ? strdup(service_name) : NULL;
 	r->client_fd = -1;
+	r->listen_fd = -1;
 	r->wake_pipe[0] = r->wake_pipe[1] = -1;
+	r->status = OBSCAM_CLIENT_CONNECTING;
+	pthread_mutex_init(&r->status_mutex, NULL);
 
 	if (pipe(r->wake_pipe) != 0) {
 		rlog(r, 2, "pipe() failed: %s", strerror(errno));
-		goto fail;
+		receiver_free(r);
+		return NULL;
 	}
 	set_cloexec(r->wake_pipe[0]);
 	set_cloexec(r->wake_pipe[1]);
+	return r;
+}
 
-	r->listen_fd = open_listen_socket(r);
-	if (r->listen_fd < 0)
-		goto fail;
-
+static bool receiver_launch(struct obscam_receiver *r)
+{
 	if (pthread_create(&r->thread, NULL, receiver_thread, r) != 0) {
 		rlog(r, 2, "pthread_create() failed");
-		close(r->listen_fd);
-		goto fail;
+		return false;
+	}
+	return true;
+}
+
+obscam_receiver_t *obscam_receiver_start(uint16_t port, const char *service_name,
+					 const struct obscam_receiver_callbacks *callbacks)
+{
+	struct obscam_receiver *r = receiver_alloc(callbacks);
+	if (!r)
+		return NULL;
+	r->port = port;
+	r->service_name = service_name ? strdup(service_name) : NULL;
+
+	r->listen_fd = open_listen_socket(r);
+	if (r->listen_fd < 0 || !receiver_launch(r)) {
+		receiver_free(r);
+		return NULL;
 	}
 	rlog(r, 0, "listening on TCP port %u", port);
 	return r;
+}
 
-fail:
-	if (r->wake_pipe[0] >= 0)
-		close(r->wake_pipe[0]);
-	if (r->wake_pipe[1] >= 0)
-		close(r->wake_pipe[1]);
-	free(r->service_name);
-	free(r);
-	return NULL;
+obscam_receiver_t *obscam_receiver_start_client(obscam_connect_fn connect_fn, void *connect_ctx,
+						void (*free_ctx)(void *), const struct obscam_receiver_callbacks *callbacks)
+{
+	struct obscam_receiver *r = receiver_alloc(callbacks);
+	if (!r) {
+		if (free_ctx && connect_ctx)
+			free_ctx(connect_ctx);
+		return NULL;
+	}
+	r->client_mode = true;
+	r->connect_fn = connect_fn;
+	r->connect_ctx = connect_ctx;
+	r->free_ctx = free_ctx;
+
+	if (!receiver_launch(r)) {
+		receiver_free(r);
+		return NULL;
+	}
+	rlog(r, 0, "client mode: connecting to the iPhone");
+	return r;
+}
+
+enum obscam_client_status obscam_receiver_client_status(obscam_receiver_t *r)
+{
+	pthread_mutex_lock(&r->status_mutex);
+	enum obscam_client_status status = r->status;
+	pthread_mutex_unlock(&r->status_mutex);
+	return status;
 }
 
 void obscam_receiver_stop(obscam_receiver_t *r)
@@ -352,11 +485,5 @@ void obscam_receiver_stop(obscam_receiver_t *r)
 	ssize_t ignored = write(r->wake_pipe[1], &c, 1);
 	(void)ignored;
 	pthread_join(r->thread, NULL);
-
-	close(r->listen_fd);
-	close(r->wake_pipe[0]);
-	close(r->wake_pipe[1]);
-	free(r->buf);
-	free(r->service_name);
-	free(r);
+	receiver_free(r);
 }

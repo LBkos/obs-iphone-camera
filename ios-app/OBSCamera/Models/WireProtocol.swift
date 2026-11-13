@@ -6,7 +6,10 @@ import Foundation
 /// Every message: `[type: u8][length: u32 BE][payload]`
 enum WireProtocol {
     static let serviceType = "_obsiphonecam._tcp"
+    /// Wi‑Fi: the OBS plugin listens here, the app connects.
     static let defaultPort: UInt16 = 47100
+    /// USB: the app listens here (loopback), the plugin connects via usbmuxd.
+    static let usbDevicePort: UInt16 = 47101
 
     enum MessageType: UInt8 {
         case hello = 0x01   // UTF-8 device name

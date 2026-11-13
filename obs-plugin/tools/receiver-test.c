@@ -2,16 +2,20 @@
  * Standalone receiver (no OBS): accepts the iOS app, decodes the stream and
  * prints statistics. Useful to test the app/network before touching OBS.
  *
- *   obscam-receiver-test [--port 47100] [--frames N] [--snapshot out.ppm]
+ *   obscam-receiver-test [--port 47100 | --usb [UDID] | --connect HOST:PORT]
+ *                        [--frames N] [--snapshot out.ppm]
  */
 #include "h264-decoder.h"
 #include "protocol.h"
 #include "receiver.h"
+#include "usbmux.h"
 
 #include <libavutil/frame.h>
 #include <libavutil/pixfmt.h>
 
+#include <netdb.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,9 +122,42 @@ static void on_decoded(void *ctx, const AVFrame *f, uint64_t pts_us)
 		atomic_store(&g_stop, true);
 }
 
+/* "host:port" -> connected TCP socket (client mode without usbmuxd). */
+static int tcp_connect(void *ctx, char *peer, size_t peer_size, enum obscam_client_status *status)
+{
+	char host[256];
+	snprintf(host, sizeof(host), "%s", (const char *)ctx);
+	char *colon = strrchr(host, ':');
+	const char *port = colon ? colon + 1 : "47101";
+	if (colon)
+		*colon = '\0';
+
+	struct addrinfo hints = {.ai_socktype = SOCK_STREAM}, *res = NULL;
+	if (getaddrinfo(host, port, &hints, &res) != 0) {
+		*status = OBSCAM_CLIENT_NO_DEVICE;
+		return -1;
+	}
+	int fd = -1;
+	for (struct addrinfo *ai = res; ai && fd < 0; ai = ai->ai_next) {
+		fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (fd >= 0 && connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
+			close(fd);
+			fd = -1;
+		}
+	}
+	freeaddrinfo(res);
+	*status = fd >= 0 ? OBSCAM_CLIENT_CONNECTED : OBSCAM_CLIENT_NO_APP;
+	if (fd >= 0)
+		snprintf(peer, peer_size, "TCP %s:%s", host, port);
+	return fd;
+}
+
 int main(int argc, char **argv)
 {
 	int port = OBSCAM_DEFAULT_PORT;
+	bool use_usb = false;
+	const char *usb_udid = NULL;
+	const char *connect_to = NULL;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--port") && i + 1 < argc)
 			port = atoi(argv[++i]);
@@ -128,8 +165,19 @@ int main(int argc, char **argv)
 			g_frames_limit = (unsigned)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--snapshot") && i + 1 < argc)
 			g_snapshot_path = argv[++i];
+		else if (!strcmp(argv[i], "--usb")) {
+			use_usb = true;
+			if (i + 1 < argc && argv[i + 1][0] != '-')
+				usb_udid = argv[++i];
+		} else if (!strcmp(argv[i], "--connect") && i + 1 < argc)
+			connect_to = argv[++i];
 		else {
-			fprintf(stderr, "usage: %s [--port N] [--frames N] [--snapshot out.ppm]\n", argv[0]);
+			fprintf(stderr,
+				"usage: %s [--port N | --usb [UDID] | --connect HOST:PORT] [--frames N] [--snapshot out.ppm]\n"
+				"  default      Wi-Fi mode: listen on port N (47100) and advertise via Bonjour\n"
+				"  --usb        USB mode: connect to the app through usbmuxd (device port %d)\n"
+				"  --connect    connect to the app's USB-mode listener over plain TCP (Simulator)\n",
+				argv[0], OBSCAM_USB_DEVICE_PORT);
 			return 2;
 		}
 	}
@@ -149,7 +197,15 @@ int main(int argc, char **argv)
 		.frame = on_frame,
 		.log = on_log,
 	};
-	obscam_receiver_t *r = obscam_receiver_start((uint16_t)port, "OBS Camera receiver test", &cb);
+	obscam_receiver_t *r;
+	if (use_usb)
+		r = obscam_receiver_start_client(obscam_usbmux_connect,
+						 obscam_usbmux_target_create(usb_udid, OBSCAM_USB_DEVICE_PORT),
+						 obscam_usbmux_target_destroy, &cb);
+	else if (connect_to)
+		r = obscam_receiver_start_client(tcp_connect, strdup(connect_to), free, &cb);
+	else
+		r = obscam_receiver_start((uint16_t)port, "OBS Camera receiver test", &cb);
 	if (!r)
 		return 1;
 

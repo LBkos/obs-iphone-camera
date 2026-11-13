@@ -33,7 +33,8 @@ final class StreamConnection: @unchecked Sendable {
 
     private let maxBytesInFlight = 2_000_000
 
-    init(endpoint: NWEndpoint, deviceName: String) {
+    /// Outgoing connection to OBS (Wi‑Fi).
+    convenience init(endpoint: NWEndpoint, deviceName: String) {
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
         tcp.connectionTimeout = 5
@@ -42,7 +43,12 @@ final class StreamConnection: @unchecked Sendable {
         let parameters = NWParameters(tls: nil, tcp: tcp)
         parameters.serviceClass = .interactiveVideo
         parameters.includePeerToPeer = true
-        self.connection = NWConnection(to: endpoint, using: parameters)
+        self.init(connection: NWConnection(to: endpoint, using: parameters), deviceName: deviceName)
+    }
+
+    /// Connection accepted from OBS (USB, see `USBListener`) or created above.
+    init(connection: NWConnection, deviceName: String) {
+        self.connection = connection
         self.deviceName = deviceName
     }
 
@@ -105,6 +111,7 @@ final class StreamConnection: @unchecked Sendable {
             droppingUntilKeyframe = false
             write(WireProtocol.message(.hello, payload: Data(deviceName.utf8)))
             startPing()
+            watchForClose()
             logger.info("Connected to \(String(describing: self.connection.endpoint), privacy: .public)")
             stateHandler?(.ready)
         case .failed(let error):
@@ -116,6 +123,20 @@ final class StreamConnection: @unchecked Sendable {
             stateHandler?(.closed)
         @unknown default:
             break
+        }
+    }
+
+    /// OBS never sends data; a completed receive means it closed the connection.
+    private func watchForClose() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] _, _, isComplete, error in
+            guard let self, self.isReady else { return }
+            if isComplete || error != nil {
+                self.isReady = false
+                self.logger.info("OBS closed the connection")
+                self.stateHandler?(.failed(error?.localizedDescription ?? "Connection closed by OBS"))
+            } else {
+                self.watchForClose()
+            }
         }
     }
 
