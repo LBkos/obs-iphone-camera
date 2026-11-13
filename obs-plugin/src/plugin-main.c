@@ -1,7 +1,7 @@
 /*
- * OBS source "iPhone Camera": receives H.264 video from the OBS Camera iOS
- * app over Wi-Fi or a USB cable, decodes it with FFmpeg and outputs it as an
- * asynchronous video source.
+ * OBS source "iPhone Camera": receives H.264 / HEVC video and PCM audio from
+ * the OBS Camera iOS app over Wi-Fi or a USB cable, decodes the video with
+ * FFmpeg and outputs it as an asynchronous video + audio source.
  */
 #include <obs-module.h>
 #include <util/dstr.h>
@@ -15,6 +15,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -34,6 +35,13 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-iphone-camera", "en-US")
 #define MODE_WIFI "wifi"
 #define MODE_USB "usb"
 #define MAX_USB_DEVICES 16
+/* Audio timestamps are re-synced to the local clock when they drift this far. */
+#define AUDIO_RESYNC_NS 500000000LL
+
+/* 10-bit / HDR output needs OBS 28+. */
+#if LIBOBS_API_MAJOR_VER >= 28
+#define HAVE_OBS_HDR 1
+#endif
 
 #define T_(s) obs_module_text(s)
 
@@ -55,6 +63,14 @@ struct iphone_camera {
 	uint32_t fps;
 	uint64_t fps_window_start_ns;
 	bool warned_format;
+	uint8_t codec;   /* OBSCAM_CODEC_*, for the status text */
+	bool has_audio;  /* for the status text */
+	bool hdr;        /* last frame was HLG/PQ */
+
+	/* Receiver thread only. */
+	bool audio_synced;
+	int64_t audio_offset_ns; /* local clock - phone clock */
+	bool warned_audio;
 };
 
 /* ---------------------------------------------------------------- receiver */
@@ -76,7 +92,13 @@ static void on_connected(void *ctx, const char *peer)
 	cam->device_name[0] = '\0';
 	cam->fps = 0;
 	cam->frames_this_second = 0;
+	cam->codec = OBSCAM_CODEC_H264;
+	cam->has_audio = false;
+	cam->hdr = false;
 	pthread_mutex_unlock(&cam->mutex);
+	/* Each connection starts as H.264 until the app says otherwise. */
+	obscam_decoder_set_codec(cam->decoder, OBSCAM_CODEC_H264);
+	cam->audio_synced = false;
 }
 
 static void on_hello(void *ctx, const char *name)
@@ -84,6 +106,60 @@ static void on_hello(void *ctx, const char *name)
 	struct iphone_camera *cam = ctx;
 	pthread_mutex_lock(&cam->mutex);
 	snprintf(cam->device_name, sizeof(cam->device_name), "%s", name);
+	pthread_mutex_unlock(&cam->mutex);
+}
+
+static void on_codec(void *ctx, uint8_t codec)
+{
+	struct iphone_camera *cam = ctx;
+	pthread_mutex_lock(&cam->mutex);
+	bool changed = cam->codec != codec;
+	cam->codec = codec;
+	pthread_mutex_unlock(&cam->mutex);
+	if (!obscam_decoder_set_codec(cam->decoder, codec))
+		blog(LOG_ERROR, "[iphone-camera] cannot open decoder for codec %u (%s)", codec,
+		     codec == OBSCAM_CODEC_HEVC ? "HEVC: FFmpeg built without the hevc decoder?" : "unknown codec");
+	else if (changed)
+		blog(LOG_INFO, "[iphone-camera] '%s': codec %s", obs_source_get_name(cam->source),
+		     codec == OBSCAM_CODEC_HEVC ? "HEVC" : "H.264");
+}
+
+static void on_audio(void *ctx, uint64_t pts_us, uint32_t sample_rate, uint8_t channels, const uint8_t *pcm,
+		     size_t frames)
+{
+	struct iphone_camera *cam = ctx;
+	if (channels > 2) {
+		if (!cam->warned_audio) {
+			blog(LOG_WARNING, "[iphone-camera] unsupported audio channel count %u", channels);
+			cam->warned_audio = true;
+		}
+		return;
+	}
+
+	/* Map the phone's capture clock to ours. The offset is taken from the
+	 * first packet and kept, so the audio stays continuous; a pause or a
+	 * big drift re-syncs it. */
+	int64_t now = (int64_t)os_gettime_ns();
+	int64_t pts_ns = (int64_t)pts_us * 1000;
+	int64_t ts = pts_ns + cam->audio_offset_ns;
+	if (!cam->audio_synced || llabs(now - ts) > AUDIO_RESYNC_NS) {
+		cam->audio_offset_ns = now - pts_ns;
+		cam->audio_synced = true;
+		ts = now;
+	}
+
+	struct obs_source_audio audio;
+	memset(&audio, 0, sizeof(audio));
+	audio.data[0] = pcm;
+	audio.frames = (uint32_t)frames;
+	audio.speakers = channels == 1 ? SPEAKERS_MONO : SPEAKERS_STEREO;
+	audio.format = AUDIO_FORMAT_16BIT;
+	audio.samples_per_sec = sample_rate;
+	audio.timestamp = (uint64_t)ts;
+	obs_source_output_audio(cam->source, &audio);
+
+	pthread_mutex_lock(&cam->mutex);
+	cam->has_audio = true;
 	pthread_mutex_unlock(&cam->mutex);
 }
 
@@ -127,6 +203,24 @@ static enum video_colorspace map_colorspace(const AVFrame *f)
 	}
 }
 
+#ifdef HAVE_OBS_HDR
+/* HDR (BT.2100) needs both the right transfer function and a 10-bit format. */
+static enum video_colorspace map_hdr_colorspace(const AVFrame *f, enum video_trc *trc)
+{
+	switch (f->color_trc) {
+	case AVCOL_TRC_ARIB_STD_B67:
+		*trc = VIDEO_TRC_HLG;
+		return VIDEO_CS_2100_HLG;
+	case AVCOL_TRC_SMPTE2084:
+		*trc = VIDEO_TRC_PQ;
+		return VIDEO_CS_2100_PQ;
+	default:
+		*trc = VIDEO_TRC_DEFAULT;
+		return map_colorspace(f);
+	}
+}
+#endif
+
 static void on_decoded(void *ctx, const AVFrame *f, uint64_t pts_us)
 {
 	(void)pts_us;
@@ -144,6 +238,14 @@ static void on_decoded(void *ctx, const AVFrame *f, uint64_t pts_us)
 	case AV_PIX_FMT_NV12:
 		format = VIDEO_FORMAT_NV12;
 		break;
+#ifdef HAVE_OBS_HDR
+	case AV_PIX_FMT_YUV420P10LE:
+		format = VIDEO_FORMAT_I010;
+		break;
+	case AV_PIX_FMT_P010LE:
+		format = VIDEO_FORMAT_P010;
+		break;
+#endif
 	default:
 		if (!cam->warned_format) {
 			blog(LOG_WARNING, "[iphone-camera] unsupported pixel format %d", f->format);
@@ -164,9 +266,23 @@ static void on_decoded(void *ctx, const AVFrame *f, uint64_t pts_us)
 	frame.full_range = full_range;
 	/* Arrival time: OBS paces async frames by timestamp; we want minimal latency. */
 	frame.timestamp = os_gettime_ns();
-	/* 8-bit formats only, so the older API is equivalent and keeps OBS 27+ compatibility. */
-	video_format_get_parameters(map_colorspace(f), full_range ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL,
-				    frame.color_matrix, frame.color_range_min, frame.color_range_max);
+	enum video_range_type range = full_range ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
+	bool hdr = false;
+#ifdef HAVE_OBS_HDR
+	enum video_trc trc = VIDEO_TRC_DEFAULT;
+	enum video_colorspace cs = map_colorspace(f);
+	if (format == VIDEO_FORMAT_I010 || format == VIDEO_FORMAT_P010) {
+		cs = map_hdr_colorspace(f, &trc);
+		hdr = trc != VIDEO_TRC_DEFAULT;
+	}
+	frame.trc = (uint8_t)trc;
+	video_format_get_parameters_for_format(cs, range, format, frame.color_matrix, frame.color_range_min,
+					       frame.color_range_max);
+#else
+	/* OBS 27: 8-bit formats only. */
+	video_format_get_parameters(map_colorspace(f), range, frame.color_matrix, frame.color_range_min,
+				    frame.color_range_max);
+#endif
 
 	obs_source_output_video(cam->source, &frame);
 
@@ -174,6 +290,7 @@ static void on_decoded(void *ctx, const AVFrame *f, uint64_t pts_us)
 	pthread_mutex_lock(&cam->mutex);
 	cam->width = frame.width;
 	cam->height = frame.height;
+	cam->hdr = hdr;
 	cam->frames_this_second++;
 	if (now - cam->fps_window_start_ns >= 1000000000ULL) {
 		cam->fps = cam->frames_this_second;
@@ -199,8 +316,10 @@ static void start_receiver(struct iphone_camera *cam)
 		.ctx = cam,
 		.connected = on_connected,
 		.hello = on_hello,
+		.codec = on_codec,
 		.config = on_config,
 		.frame = on_frame,
+		.audio = on_audio,
 		.disconnected = on_disconnected,
 		.log = on_log,
 	};
@@ -375,6 +494,8 @@ static obs_properties_t *iphone_camera_properties(void *data)
 		} else if (cam->connected) {
 			dstr_printf(&status, T_("Status.Connected"), cam->device_name[0] ? cam->device_name : "iPhone",
 				    cam->peer, cam->width, cam->height, cam->fps);
+			dstr_catf(&status, "\n%s%s%s", cam->codec == OBSCAM_CODEC_HEVC ? "HEVC" : "H.264",
+				  cam->hdr ? " HDR" : "", cam->has_audio ? T_("Status.WithAudio") : "");
 		} else if (cam->usb_mode) {
 			usb_status_text(cam, &status, &info_type);
 		} else {
@@ -404,7 +525,7 @@ static obs_properties_t *iphone_camera_properties(void *data)
 static struct obs_source_info iphone_camera_info = {
 	.id = "iphone_camera_source",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_DO_NOT_DUPLICATE,
+	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE,
 	.get_name = iphone_camera_get_name,
 	.create = iphone_camera_create,
 	.destroy = iphone_camera_destroy,
@@ -424,5 +545,5 @@ bool obs_module_load(void)
 
 const char *obs_module_description(void)
 {
-	return "Use an iPhone as a camera via the OBS Camera iOS app (Wi-Fi or USB).";
+	return "Use an iPhone as a camera and microphone via the OBS Camera iOS app (Wi-Fi or USB).";
 }

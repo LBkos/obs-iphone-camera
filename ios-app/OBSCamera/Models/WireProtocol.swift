@@ -13,9 +13,16 @@ enum WireProtocol {
 
     enum MessageType: UInt8 {
         case hello = 0x01   // UTF-8 device name
-        case config = 0x02  // SPS + PPS, Annex-B
+        case config = 0x02  // parameter sets, Annex-B: SPS + PPS (H.264) or VPS + SPS + PPS (HEVC)
         case frame = 0x03   // [pts_us: u64 BE][flags: u8][access unit, Annex-B]
         case ping = 0x04    // keep-alive
+        case codec = 0x05   // [codec: u8], sent before every config
+        case audio = 0x06   // [pts_us: u64 BE][sample_rate: u32 BE][channels: u8][PCM s16le interleaved]
+    }
+
+    enum Codec: UInt8 {
+        case h264 = 0
+        case hevc = 1
     }
 
     static let keyframeFlag: UInt8 = 0x01
@@ -35,6 +42,15 @@ enum WireProtocol {
         payload.append(isKeyframe ? keyframeFlag : 0)
         payload.append(annexB)
         return message(.frame, payload: payload)
+    }
+
+    static func audioMessage(ptsMicros: UInt64, sampleRate: UInt32, channels: UInt8, pcm: Data) -> Data {
+        var payload = Data(capacity: 13 + pcm.count)
+        payload.appendBigEndian(ptsMicros)
+        payload.appendBigEndian(sampleRate)
+        payload.append(channels)
+        payload.append(pcm)
+        return message(.audio, payload: payload)
     }
 }
 

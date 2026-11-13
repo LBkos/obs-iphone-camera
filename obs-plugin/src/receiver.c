@@ -251,6 +251,26 @@ static bool handle_message(struct obscam_receiver *r, uint8_t type, const uint8_
 		return true;
 	case OBSCAM_MSG_PING:
 		return true;
+	case OBSCAM_MSG_CODEC:
+		if (size < 1)
+			return false;
+		if (r->cb.codec)
+			r->cb.codec(r->cb.ctx, payload[0]);
+		return true;
+	case OBSCAM_MSG_AUDIO: {
+		if (size < OBSCAM_AUDIO_PREFIX_SIZE)
+			return false;
+		uint32_t rate = read_u32_be(payload + 8);
+		uint8_t channels = payload[12];
+		if (rate == 0 || channels == 0 || channels > OBSCAM_MAX_AUDIO_CHANNELS)
+			return false;
+		size_t bytes = size - OBSCAM_AUDIO_PREFIX_SIZE;
+		size_t frames = bytes / (2u * channels);
+		if (r->cb.audio && frames > 0)
+			r->cb.audio(r->cb.ctx, read_u64_be(payload), rate, channels, payload + OBSCAM_AUDIO_PREFIX_SIZE,
+				    frames);
+		return true;
+	}
 	default:
 		/* Unknown messages are skipped for forward compatibility. */
 		return true;

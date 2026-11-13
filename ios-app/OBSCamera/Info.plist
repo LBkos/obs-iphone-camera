@@ -26,6 +26,8 @@
 	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Камера передаёт видео в OBS на вашем компьютере.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Микрофон передаёт звук в OBS, если вы включили звук в настройках.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Нужно, чтобы найти OBS в локальной сети и отправлять в него видео.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
