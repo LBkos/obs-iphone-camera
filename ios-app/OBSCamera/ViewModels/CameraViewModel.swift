@@ -9,6 +9,12 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var stats = StreamingEngine.Stats()
     @Published private(set) var discoveryError: String?
     @Published private(set) var cameraAccessDenied = false
+    @Published private(set) var microphoneAccessDenied = false
+    @Published private(set) var capabilities = CameraCapabilities()
+    /// Preview point of the last tap-to-focus, shown briefly.
+    @Published private(set) var focusIndicator: CGPoint?
+    /// Black screen while streaming: the phone's display is not needed then.
+    @Published private(set) var isScreenBlack = false
     /// Last connection error while auto-reconnecting.
     @Published private(set) var reconnectError: String?
     @Published var settings: StreamSettings {
@@ -16,6 +22,14 @@ final class CameraViewModel: ObservableObject {
             guard settings != oldValue else { return }
             settings.save()
             applySettings()
+        }
+    }
+    /// Live camera adjustments: applied without restarting capture.
+    @Published var controls: CameraControls {
+        didSet {
+            guard controls != oldValue else { return }
+            controls.save()
+            engine.camera.apply(controls)
         }
     }
     @Published var manualAddress: String {
@@ -34,10 +48,14 @@ final class CameraViewModel: ObservableObject {
     private var lastHost: OBSHost?
     private var reconnectTask: Task<Void, Never>?
     private var didStart = false
+    private var zoomAtPinchStart: Double?
+    private var focusIndicatorTask: Task<Void, Never>?
+    private var brightnessBeforeBlack: CGFloat?
     private static let manualAddressKey = "manualAddress"
 
     init() {
         settings = StreamSettings.load()
+        controls = CameraControls.load()
         manualAddress = UserDefaults.standard.string(forKey: Self.manualAddressKey) ?? ""
         connectionMode = ConnectionMode.load()
 
@@ -52,6 +70,12 @@ final class CameraViewModel: ObservableObject {
         }
         browser.errorHandler = { [weak self] message in
             Task { @MainActor in self?.discoveryError = message }
+        }
+        engine.camera.capabilitiesHandler = { [weak self] capabilities in
+            Task { @MainActor in self?.capabilities = capabilities }
+        }
+        engine.camera.controlsChangedHandler = { [weak self] controls in
+            Task { @MainActor in self?.controls = controls }
         }
     }
 
@@ -94,6 +118,8 @@ final class CameraViewModel: ObservableObject {
         guard !didStart else { return }
         didStart = true
         await requestCameraAccessIfNeeded()
+        await requestMicrophoneAccessIfNeeded()
+        engine.camera.apply(controls)
         engine.startCapture(with: settings)
         applyConnectionMode()
     }
@@ -132,9 +158,106 @@ final class CameraViewModel: ObservableObject {
             // stays open (keep-alive pings) and resumes on return.
             engine.stopCapture()
             browser.stop()
+            exitBlackScreen() // brightness is system-wide: give it back
+            // The torch turns off with the camera; don't switch it on again by surprise.
+            controls.torch = false
         default:
             break
         }
+    }
+
+    // MARK: - Camera controls
+
+    /// Pinch on the preview. `scale` is relative to the pinch start; nil ends the pinch.
+    func pinchZoom(scale: CGFloat?) {
+        guard let scale else {
+            zoomAtPinchStart = nil
+            return
+        }
+        let start = zoomAtPinchStart ?? controls.zoom
+        zoomAtPinchStart = start
+        controls.zoom = min(max(start * Double(scale), capabilities.minZoom), capabilities.maxZoom)
+    }
+
+    /// Tap on the preview: focus/expose there (for the parts in auto mode).
+    func tapToFocus(devicePoint: CGPoint, previewPoint: CGPoint) {
+        guard controls.focusMode == .auto || controls.exposureMode == .auto else { return }
+        engine.camera.focus(atDevicePoint: devicePoint)
+        focusIndicator = previewPoint
+        focusIndicatorTask?.cancel()
+        focusIndicatorTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            self?.focusIndicator = nil
+        }
+    }
+
+    // Switching to manual starts from the camera's current automatic values,
+    // so the picture doesn't jump.
+
+    func setFocusMode(_ mode: ControlMode) {
+        var updated = controls
+        if mode == .manual, controls.focusMode != .manual, let readings = engine.camera.readings() {
+            updated.lensPosition = readings.lensPosition
+        }
+        updated.focusMode = mode
+        controls = updated
+    }
+
+    func setExposureMode(_ mode: ControlMode) {
+        var updated = controls
+        if mode == .manual, controls.exposureMode != .manual, let readings = engine.camera.readings() {
+            updated.iso = min(max(readings.iso, capabilities.minISO), max(capabilities.minISO, capabilities.maxISO))
+            if readings.exposureSeconds > 0, let nearest = capabilities.shutterDenominators.min(by: {
+                abs(log(1 / Double($0) / readings.exposureSeconds)) < abs(log(1 / Double($1) / readings.exposureSeconds))
+            }) {
+                updated.shutterDenominator = nearest
+            }
+        }
+        updated.exposureMode = mode
+        controls = updated
+    }
+
+    func setWhiteBalanceMode(_ mode: ControlMode) {
+        var updated = controls
+        if mode == .manual, controls.whiteBalanceMode != .manual, let readings = engine.camera.readings() {
+            updated.temperature = min(max(readings.temperature, CameraControls.temperatureRange.lowerBound),
+                                      CameraControls.temperatureRange.upperBound)
+            updated.tint = min(max(readings.tint, CameraControls.tintRange.lowerBound),
+                               CameraControls.tintRange.upperBound)
+        }
+        updated.whiteBalanceMode = mode
+        controls = updated
+    }
+
+    func resetControls() {
+        var reset = CameraControls()
+        reset.torch = controls.torch
+        controls = reset
+    }
+
+    // MARK: - Black screen
+
+    func enterBlackScreen() {
+        guard !isScreenBlack else { return }
+        isScreenBlack = true
+        if let screen = Self.currentScreen {
+            brightnessBeforeBlack = screen.brightness
+            screen.brightness = 0
+        }
+    }
+
+    func exitBlackScreen() {
+        guard isScreenBlack else { return }
+        isScreenBlack = false
+        if let brightness = brightnessBeforeBlack {
+            Self.currentScreen?.brightness = brightness
+        }
+        brightnessBeforeBlack = nil
+    }
+
+    private static var currentScreen: UIScreen? {
+        UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen }.first
     }
 
     func openSystemSettings() {
@@ -198,7 +321,24 @@ final class CameraViewModel: ObservableObject {
         Task {
             // Switching from the test pattern to a camera may need permission first.
             await requestCameraAccessIfNeeded()
+            await requestMicrophoneAccessIfNeeded()
             engine.startCapture(with: settings)
+        }
+    }
+
+    private func requestMicrophoneAccessIfNeeded() async {
+        guard settings.audioEnabled else {
+            microphoneAccessDenied = false
+            return
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .notDetermined:
+            let granted = await AVCaptureDevice.requestAccess(for: .audio)
+            microphoneAccessDenied = !granted
+        case .denied, .restricted:
+            microphoneAccessDenied = true
+        default:
+            microphoneAccessDenied = false
         }
     }
 

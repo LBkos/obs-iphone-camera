@@ -22,8 +22,12 @@ struct obscam_receiver_callbacks {
 	void *ctx;
 	void (*connected)(void *ctx, const char *peer_address);
 	void (*hello)(void *ctx, const char *device_name);
+	void (*codec)(void *ctx, uint8_t codec); /* OBSCAM_CODEC_*, before each config */
 	void (*config)(void *ctx, const uint8_t *data, size_t size);
 	void (*frame)(void *ctx, uint64_t pts_us, bool keyframe, const uint8_t *data, size_t size);
+	/* pcm: interleaved signed 16-bit little-endian; frames = samples per channel. */
+	void (*audio)(void *ctx, uint64_t pts_us, uint32_t sample_rate, uint8_t channels, const uint8_t *pcm,
+		      size_t frames);
 	void (*disconnected)(void *ctx);
 	obscam_log_fn log; /* level: 0 = info, 1 = warning, 2 = error */
 };

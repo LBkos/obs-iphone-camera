@@ -25,7 +25,8 @@
 
 static atomic_bool g_stop;
 static obscam_decoder_t *g_decoder;
-static atomic_uint g_decoded, g_received;
+static atomic_uint g_decoded, g_received, g_audio_frames;
+static atomic_int g_audio_rate, g_audio_channels, g_pix_fmt, g_trc;
 static unsigned g_frames_limit;
 static const char *g_snapshot_path;
 static bool g_snapshot_done;
@@ -51,10 +52,31 @@ static void on_connected(void *ctx, const char *peer)
 	obscam_decoder_reset(g_decoder);
 }
 
+static void on_codec(void *ctx, uint8_t codec)
+{
+	(void)ctx;
+	static int last = -1;
+	if (last != codec)
+		fprintf(stderr, "[info] codec: %s\n", codec == OBSCAM_CODEC_HEVC ? "HEVC" : "H.264");
+	last = codec;
+	if (!obscam_decoder_set_codec(g_decoder, codec))
+		fprintf(stderr, "[error] cannot open decoder for codec %u\n", codec);
+}
+
+static void on_audio(void *ctx, uint64_t pts_us, uint32_t rate, uint8_t channels, const uint8_t *pcm, size_t frames)
+{
+	(void)ctx;
+	(void)pts_us;
+	(void)pcm;
+	atomic_store(&g_audio_rate, (int)rate);
+	atomic_store(&g_audio_channels, channels);
+	atomic_fetch_add(&g_audio_frames, (unsigned)frames);
+}
+
 static void on_config(void *ctx, const uint8_t *data, size_t size)
 {
 	(void)ctx;
-	fprintf(stderr, "[info] got SPS/PPS (%zu bytes)\n", size);
+	fprintf(stderr, "[info] got parameter sets (%zu bytes)\n", size);
 	obscam_decoder_set_config(g_decoder, data, size);
 }
 
@@ -71,7 +93,7 @@ static uint8_t clamp8(int v)
 	return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
 }
 
-/* BT.709 limited-range YUV -> RGB, written as binary PPM. */
+/* BT.709 limited-range YUV -> RGB, written as binary PPM (10-bit is cut to 8 bits, no tone mapping). */
 static void write_snapshot(const AVFrame *f)
 {
 	FILE *fp = fopen(g_snapshot_path, "wb");
@@ -80,17 +102,28 @@ static void write_snapshot(const AVFrame *f)
 		return;
 	}
 	bool nv12 = f->format == AV_PIX_FMT_NV12;
+	bool ten_bit = f->format == AV_PIX_FMT_YUV420P10LE;
+	if (!nv12 && !ten_bit && f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P) {
+		fprintf(stderr, "[warn] snapshot: unsupported pixel format %d\n", f->format);
+		fclose(fp);
+		return;
+	}
 	fprintf(fp, "P6\n%d %d\n255\n", f->width, f->height);
 	uint8_t *row = malloc((size_t)f->width * 3);
 	for (int y = 0; y < f->height; y++) {
 		for (int x = 0; x < f->width; x++) {
-			int Y = f->data[0][y * f->linesize[0] + x];
-			int U, V;
-			if (nv12) {
+			int Y, U, V;
+			if (ten_bit) {
+				Y = ((const uint16_t *)(f->data[0] + y * f->linesize[0]))[x] >> 2;
+				U = ((const uint16_t *)(f->data[1] + (y / 2) * f->linesize[1]))[x / 2] >> 2;
+				V = ((const uint16_t *)(f->data[2] + (y / 2) * f->linesize[2]))[x / 2] >> 2;
+			} else if (nv12) {
+				Y = f->data[0][y * f->linesize[0] + x];
 				const uint8_t *uv = f->data[1] + (y / 2) * f->linesize[1] + (x / 2) * 2;
 				U = uv[0];
 				V = uv[1];
 			} else {
+				Y = f->data[0][y * f->linesize[0] + x];
 				U = f->data[1][(y / 2) * f->linesize[1] + x / 2];
 				V = f->data[2][(y / 2) * f->linesize[2] + x / 2];
 			}
@@ -112,6 +145,8 @@ static void on_decoded(void *ctx, const AVFrame *f, uint64_t pts_us)
 	(void)pts_us;
 	g_width = f->width;
 	g_height = f->height;
+	atomic_store(&g_pix_fmt, f->format);
+	atomic_store(&g_trc, f->color_trc);
 	unsigned n = atomic_fetch_add(&g_decoded, 1) + 1;
 	/* Skip the first frames so the encoder's rate control has settled. */
 	if (g_snapshot_path && !g_snapshot_done && n >= 30) {
@@ -193,8 +228,10 @@ int main(int argc, char **argv)
 
 	struct obscam_receiver_callbacks cb = {
 		.connected = on_connected,
+		.codec = on_codec,
 		.config = on_config,
 		.frame = on_frame,
+		.audio = on_audio,
 		.log = on_log,
 	};
 	obscam_receiver_t *r;
@@ -209,15 +246,19 @@ int main(int argc, char **argv)
 	if (!r)
 		return 1;
 
-	unsigned last = 0;
+	unsigned last = 0, last_audio = 0;
 	while (!atomic_load(&g_stop)) {
 		sleep(1);
 		unsigned now = atomic_load(&g_decoded);
-		if (now != last)
-			printf("decoded=%u received=%u fps=%u size=%dx%d\n", now, atomic_load(&g_received), now - last,
-			       g_width, g_height);
+		unsigned audio = atomic_load(&g_audio_frames);
+		if (now != last || audio != last_audio)
+			printf("decoded=%u received=%u fps=%u size=%dx%d pix_fmt=%d trc=%d audio=%u samples/s (%d Hz, %d ch)\n",
+			       now, atomic_load(&g_received), now - last, g_width, g_height, atomic_load(&g_pix_fmt),
+			       atomic_load(&g_trc), audio - last_audio, atomic_load(&g_audio_rate),
+			       atomic_load(&g_audio_channels));
 		fflush(stdout);
 		last = now;
+		last_audio = audio;
 	}
 
 	obscam_receiver_stop(r);

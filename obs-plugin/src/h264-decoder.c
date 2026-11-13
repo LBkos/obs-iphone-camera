@@ -1,4 +1,5 @@
 #include "h264-decoder.h"
+#include "protocol.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
@@ -9,6 +10,7 @@ struct obscam_decoder {
 	AVCodecContext *ctx;
 	AVPacket *pkt;
 	AVFrame *frame;
+	uint8_t codec; /* OBSCAM_CODEC_* */
 	obscam_frame_fn on_frame;
 	void *user;
 
@@ -23,7 +25,7 @@ struct obscam_decoder {
 
 static bool open_codec(struct obscam_decoder *d)
 {
-	const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+	const AVCodec *codec = avcodec_find_decoder(d->codec == OBSCAM_CODEC_HEVC ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
 	if (!codec)
 		return false;
 	d->ctx = avcodec_alloc_context3(codec);
@@ -49,6 +51,7 @@ obscam_decoder_t *obscam_decoder_create(obscam_frame_fn on_frame, void *ctx)
 	d->on_frame = on_frame;
 	d->user = ctx;
 	d->waiting_for_keyframe = true;
+	d->codec = OBSCAM_CODEC_H264;
 	d->pkt = av_packet_alloc();
 	d->frame = av_frame_alloc();
 	if (!d->pkt || !d->frame || !open_codec(d)) {
@@ -68,6 +71,23 @@ void obscam_decoder_destroy(obscam_decoder_t *d)
 	free(d->config);
 	free(d->buf);
 	free(d);
+}
+
+bool obscam_decoder_set_codec(obscam_decoder_t *d, uint8_t codec)
+{
+	if (codec != OBSCAM_CODEC_H264 && codec != OBSCAM_CODEC_HEVC)
+		return false;
+	if (codec == d->codec && d->ctx)
+		return true;
+	avcodec_free_context(&d->ctx);
+	d->codec = codec;
+	/* Parameter sets of the old codec are useless now; new ones follow. */
+	free(d->config);
+	d->config = NULL;
+	d->config_size = 0;
+	d->config_pending = false;
+	d->waiting_for_keyframe = true;
+	return open_codec(d);
 }
 
 void obscam_decoder_set_config(obscam_decoder_t *d, const uint8_t *data, size_t size)
@@ -92,6 +112,8 @@ void obscam_decoder_reset(obscam_decoder_t *d)
 
 bool obscam_decoder_decode(obscam_decoder_t *d, const uint8_t *data, size_t size, bool keyframe, uint64_t pts_us)
 {
+	if (!d->ctx)
+		return false; /* codec failed to open */
 	if (d->waiting_for_keyframe) {
 		if (!keyframe)
 			return true; /* silently skip until we can start cleanly */

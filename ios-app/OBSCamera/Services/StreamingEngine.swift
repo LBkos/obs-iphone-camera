@@ -2,7 +2,7 @@ import AVFoundation
 import Network
 import os
 
-/// Wires frame source → H.264 encoder → network connection.
+/// Wires frame source → video encoder → network connection (plus microphone audio).
 /// Thread-safe; all handlers are delivered on the main queue.
 final class StreamingEngine: @unchecked Sendable {
     enum Status: Equatable {
@@ -23,7 +23,7 @@ final class StreamingEngine: @unchecked Sendable {
 
     let camera = CameraCaptureService()
     private let testPattern = TestPatternSource()
-    private let encoder = H264Encoder()
+    private let encoder = VideoEncoder()
     private let usbListener = USBListener()
     private let logger = Logger(subsystem: "com.obscamera.app", category: "Engine")
     private static let usbHostName = "OBS (USB)"
@@ -38,6 +38,7 @@ final class StreamingEngine: @unchecked Sendable {
     private var framesSent = 0
     private var bytesSent = 0
     private var statsTimer: Timer?
+    private var warnedAudioFormat = false
 
     init() {
         encoder.outputHandler = { [weak self] frame in
@@ -59,6 +60,23 @@ final class StreamingEngine: @unchecked Sendable {
         }
         camera.frameHandler = frameHandler
         testPattern.frameHandler = frameHandler
+        camera.audioHandler = { [weak self] sampleBuffer in
+            guard let self else { return }
+            self.lock.lock()
+            let connection = self.isStreaming ? self.connection : nil
+            self.lock.unlock()
+            guard let connection else { return }
+            guard let chunk = AudioPCM.chunk(from: sampleBuffer) else {
+                if !self.warnedAudioFormat {
+                    self.warnedAudioFormat = true // audio queue only
+                    let format = CMSampleBufferGetFormatDescription(sampleBuffer).map { String(describing: $0) } ?? "none"
+                    self.logger.error("Unsupported microphone format: \(format, privacy: .public)")
+                }
+                return
+            }
+            connection.sendAudio(pcm: chunk.pcm, ptsMicros: chunk.ptsMicros, sampleRate: chunk.sampleRate,
+                                 channels: chunk.channels)
+        }
         usbListener.connectionHandler = { [weak self] connection in
             self?.attachUSB(connection)
         }

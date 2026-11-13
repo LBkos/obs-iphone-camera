@@ -3,13 +3,35 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var viewModel: CameraViewModel
     @Environment(\.scenePhase) private var scenePhase
-    @State private var showsSettings = false
+    @State private var activeSheet: Sheet?
     @FocusState private var addressFocused: Bool
+    @AppStorage(DisplayOptions.showGridKey) private var showGrid = false
+    @AppStorage(DisplayOptions.showLevelKey) private var showLevel = false
+
+    private enum Sheet: String, Identifiable {
+        case settings
+        case cameraControls
+        var id: String { rawValue }
+    }
+
+    private var isCameraPreview: Bool {
+        viewModel.effectiveSource != .testPattern && !viewModel.cameraAccessDenied
+    }
 
     var body: some View {
         ZStack {
             preview
                 .ignoresSafeArea()
+
+            if isCameraPreview && !viewModel.isScreenBlack {
+                if showGrid {
+                    GridOverlay(aspectRatio: displayAspectRatio)
+                        .ignoresSafeArea()
+                }
+                if showLevel {
+                    LevelOverlay(orientation: viewModel.settings.orientation)
+                }
+            }
 
             VStack(spacing: 12) {
                 StatusBadge(text: viewModel.statusText, detail: viewModel.statsText, status: viewModel.status)
@@ -17,13 +39,43 @@ struct ContentView: View {
                 controlPanel
             }
             .padding()
+
+            if viewModel.isScreenBlack {
+                BlackScreenView(onExit: viewModel.exitBlackScreen)
+            }
         }
         .task { await viewModel.onAppear() }
         .onChange(of: scenePhase) { _, phase in viewModel.scenePhaseChanged(phase) }
-        .sheet(isPresented: $showsSettings) {
-            SettingsView(settings: $viewModel.settings)
-                .presentationDetents([.medium, .large])
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .settings:
+                SettingsView(viewModel: viewModel)
+                    .presentationDetents([.medium, .large])
+            case .cameraControls:
+                CameraControlsView(viewModel: viewModel)
+                    // Medium keeps the preview visible while adjusting.
+                    .presentationDetents([.medium, .large])
+                    .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+            }
         }
+    }
+
+    /// "Main camera · 1080p · 30 fps · 2.0×"
+    private var summaryText: String {
+        let settings = viewModel.settings
+        var parts = [settings.source.title, settings.resolution.rawValue, "\(settings.frameRate) fps"]
+        if viewModel.controls.zoom > 1.01 {
+            parts.append(String(format: "%.1f×", viewModel.controls.zoom))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Width / height of the video as shown on the portrait screen.
+    private var displayAspectRatio: CGFloat {
+        let size = viewModel.settings.resolution.landscapeSize
+        let landscape = CGFloat(size.width) / CGFloat(size.height)
+        // Landscape video is shown sideways (rotation 0), so it is wide on screen.
+        return viewModel.settings.orientation == .landscape ? landscape : 1 / landscape
     }
 
     // MARK: - Preview
@@ -36,7 +88,18 @@ struct ContentView: View {
             CameraDeniedView(openSettings: viewModel.openSystemSettings)
         } else {
             CameraPreviewView(session: viewModel.captureSession,
-                              rotationAngle: viewModel.settings.orientation.rotationAngle)
+                              rotationAngle: viewModel.settings.orientation.rotationAngle,
+                              isMirrored: viewModel.settings.mirror,
+                              isEnabled: !viewModel.isScreenBlack,
+                              onTap: { devicePoint, viewPoint in
+                                  viewModel.tapToFocus(devicePoint: devicePoint, previewPoint: viewPoint)
+                              },
+                              onPinch: { scale in viewModel.pinchZoom(scale: scale) })
+                .overlay {
+                    if let point = viewModel.focusIndicator {
+                        FocusIndicator(point: point)
+                    }
+                }
         }
     }
 
@@ -68,14 +131,37 @@ struct ContentView: View {
                 }
             }
 
-            HStack {
-                Text(viewModel.settings.source.title + " · " + viewModel.settings.resolution.rawValue
-                     + " · \(viewModel.settings.frameRate) fps")
+            HStack(spacing: 18) {
+                Text(summaryText)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                    .lineLimit(2)
                 Spacer()
+                if isCameraPreview {
+                    if viewModel.capabilities.hasTorch {
+                        Button {
+                            viewModel.controls.torch.toggle()
+                        } label: {
+                            Image(systemName: viewModel.controls.torch ? "flashlight.on.fill" : "flashlight.off.fill")
+                                .font(.title3)
+                        }
+                        .accessibilityLabel(viewModel.controls.torch ? "Выключить фонарик" : "Включить фонарик")
+                    }
+                    Button {
+                        activeSheet = .cameraControls
+                    } label: {
+                        Image(systemName: "camera.aperture")
+                            .font(.title3)
+                    }
+                    .accessibilityLabel("Камера: фокус, экспозиция, баланс белого")
+                }
+                Button(action: viewModel.enterBlackScreen) {
+                    Image(systemName: "moon.fill")
+                        .font(.title3)
+                }
+                .accessibilityLabel("Выключить экран")
                 Button {
-                    showsSettings = true
+                    activeSheet = .settings
                 } label: {
                     Image(systemName: "gearshape.fill")
                         .font(.title3)
