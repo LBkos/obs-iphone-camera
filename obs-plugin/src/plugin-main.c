@@ -32,11 +32,47 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-iphone-camera", "en-US")
 #define S_USB_DEVICE "usb_device"
 #define S_KEEP_LAST_FRAME "keep_last_frame"
 
+/* Camera remote control (sent to the app as CONTROLS JSON). */
+#define S_REMOTE "remote_control"
+#define S_ZOOM "cc_zoom"
+#define S_FOCUS_MODE "cc_focus_mode"
+#define S_LENS "cc_lens_position"
+#define S_EXPOSURE_MODE "cc_exposure_mode"
+#define S_EV "cc_exposure_bias"
+#define S_ISO "cc_iso"
+#define S_SHUTTER "cc_shutter"
+#define S_WB_MODE "cc_wb_mode"
+#define S_TEMPERATURE "cc_temperature"
+#define S_TINT "cc_tint"
+#define S_TORCH "cc_torch"
+
+#define CONTROL_AUTO "auto"
+#define CONTROL_LOCKED "locked"
+#define CONTROL_MANUAL "manual"
+#define MAX_SHUTTERS 32
+
 #define MODE_WIFI "wifi"
 #define MODE_USB "usb"
 #define MAX_USB_DEVICES 16
 /* Audio timestamps are re-synced to the local clock when they drift this far. */
 #define AUDIO_RESYNC_NS 500000000LL
+
+/* Same values as CameraControls in the iOS app. */
+static const int default_shutters[] = {24, 25, 30, 48, 50, 60, 100, 120, 125, 180, 240, 250, 500, 1000, 2000, 4000, 8000};
+
+/* What the iPhone's active camera supports (CAPABILITIES message). */
+struct camera_caps {
+	bool known;
+	double min_zoom, max_zoom;
+	bool focus_lock, focus_manual;
+	bool exposure_lock, exposure_manual;
+	double min_iso, max_iso;
+	double min_bias, max_bias;
+	int shutters[MAX_SHUTTERS];
+	size_t shutter_count;
+	bool wb_lock, wb_manual;
+	bool torch;
+};
 
 /* 10-bit / HDR output needs OBS 28+. */
 #if LIBOBS_API_MAJOR_VER >= 28
@@ -66,6 +102,9 @@ struct iphone_camera {
 	uint8_t codec;   /* OBSCAM_CODEC_*, for the status text */
 	bool has_audio;  /* for the status text */
 	bool hdr;        /* last frame was HLG/PQ */
+	struct camera_caps caps;
+	char *caps_json;     /* last CAPABILITIES payload, to notice changes */
+	char *controls_json; /* CONTROLS payload to send, NULL = app controls the camera */
 
 	/* Receiver thread only. */
 	bool audio_synced;
@@ -106,7 +145,72 @@ static void on_hello(void *ctx, const char *name)
 	struct iphone_camera *cam = ctx;
 	pthread_mutex_lock(&cam->mutex);
 	snprintf(cam->device_name, sizeof(cam->device_name), "%s", name);
+	char *json = cam->controls_json ? bstrdup(cam->controls_json) : NULL;
+	obscam_receiver_t *receiver = cam->receiver;
 	pthread_mutex_unlock(&cam->mutex);
+
+	/* The app is ready: take over the camera if remote control is on. */
+	if (json) {
+		obscam_receiver_send(receiver, OBSCAM_MSG_CONTROLS, json, strlen(json));
+		bfree(json);
+	}
+}
+
+static void parse_caps(obs_data_t *data, struct camera_caps *caps)
+{
+	memset(caps, 0, sizeof(*caps));
+	caps->known = true;
+	caps->min_zoom = obs_data_get_double(data, "minZoom");
+	caps->max_zoom = obs_data_get_double(data, "maxZoom");
+	caps->focus_lock = obs_data_get_bool(data, "supportsFocusLock");
+	caps->focus_manual = obs_data_get_bool(data, "supportsManualFocus");
+	caps->exposure_lock = obs_data_get_bool(data, "supportsExposureLock");
+	caps->exposure_manual = obs_data_get_bool(data, "supportsManualExposure");
+	caps->min_iso = obs_data_get_double(data, "minISO");
+	caps->max_iso = obs_data_get_double(data, "maxISO");
+	caps->min_bias = obs_data_get_double(data, "minExposureBias");
+	caps->max_bias = obs_data_get_double(data, "maxExposureBias");
+	caps->wb_lock = obs_data_get_bool(data, "supportsWhiteBalanceLock");
+	caps->wb_manual = obs_data_get_bool(data, "supportsManualWhiteBalance");
+	caps->torch = obs_data_get_bool(data, "hasTorch");
+
+	obs_data_array_t *shutters = obs_data_get_array(data, "shutterDenominators");
+	size_t count = obs_data_array_count(shutters);
+	for (size_t i = 0; i < count && caps->shutter_count < MAX_SHUTTERS; i++) {
+		obs_data_t *item = obs_data_array_item(shutters, i);
+		/* obs_data skips plain numbers in arrays, so the app sends {"value": n}. */
+		long long value = obs_data_get_int(item, "value");
+		if (value > 0)
+			caps->shutters[caps->shutter_count++] = (int)value;
+		obs_data_release(item);
+	}
+	obs_data_array_release(shutters);
+}
+
+static void on_capabilities(void *ctx, const char *json, size_t size)
+{
+	struct iphone_camera *cam = ctx;
+	char *text = bstrdup_n(json, size);
+	obs_data_t *data = obs_data_create_from_json(text);
+	if (!data) {
+		blog(LOG_WARNING, "[iphone-camera] invalid capabilities from the app");
+		bfree(text);
+		return;
+	}
+	struct camera_caps caps;
+	parse_caps(data, &caps);
+	obs_data_release(data);
+
+	pthread_mutex_lock(&cam->mutex);
+	bool changed = !cam->caps_json || strcmp(cam->caps_json, text) != 0;
+	cam->caps = caps;
+	bfree(cam->caps_json);
+	cam->caps_json = text;
+	pthread_mutex_unlock(&cam->mutex);
+
+	/* New ranges (e.g. the app switched lenses): rebuild an open properties window. */
+	if (changed)
+		obs_source_update_properties(cam->source);
 }
 
 static void on_codec(void *ctx, uint8_t codec)
@@ -306,8 +410,18 @@ static void stop_receiver(struct iphone_camera *cam)
 {
 	if (cam->receiver) {
 		obscam_receiver_stop(cam->receiver);
+		pthread_mutex_lock(&cam->mutex);
 		cam->receiver = NULL;
+		pthread_mutex_unlock(&cam->mutex);
 	}
+}
+
+static void set_receiver(struct iphone_camera *cam, obscam_receiver_t *receiver)
+{
+	/* on_hello reads it from the receiver thread. */
+	pthread_mutex_lock(&cam->mutex);
+	cam->receiver = receiver;
+	pthread_mutex_unlock(&cam->mutex);
 }
 
 static void start_receiver(struct iphone_camera *cam)
@@ -320,14 +434,15 @@ static void start_receiver(struct iphone_camera *cam)
 		.config = on_config,
 		.frame = on_frame,
 		.audio = on_audio,
+		.capabilities = on_capabilities,
 		.disconnected = on_disconnected,
 		.log = on_log,
 	};
 
 	if (cam->usb_mode) {
 		void *target = obscam_usbmux_target_create(cam->usb_device, OBSCAM_USB_DEVICE_PORT);
-		cam->receiver = obscam_receiver_start_client(obscam_usbmux_connect, target,
-							     obscam_usbmux_target_destroy, &cb);
+		set_receiver(cam, obscam_receiver_start_client(obscam_usbmux_connect, target,
+								 obscam_usbmux_target_destroy, &cb));
 		return;
 	}
 
@@ -341,13 +456,54 @@ static void start_receiver(struct iphone_camera *cam)
 	/* DNS-SD instance names are limited to 63 bytes. */
 	char service_name[64];
 	snprintf(service_name, sizeof(service_name), "%s - %s", host, obs_source_get_name(cam->source));
-	cam->receiver = obscam_receiver_start(cam->port, service_name, &cb);
+	set_receiver(cam, obscam_receiver_start(cam->port, service_name, &cb));
 }
 
 static const char *iphone_camera_get_name(void *unused)
 {
 	(void)unused;
 	return T_("iPhoneCamera");
+}
+
+/* CONTROLS payload for the app (see protocol.h), NULL when remote control is off. */
+static char *build_controls_json(obs_data_t *settings)
+{
+	if (!obs_data_get_bool(settings, S_REMOTE))
+		return NULL;
+	obs_data_t *c = obs_data_create();
+	obs_data_set_double(c, "zoom", obs_data_get_double(settings, S_ZOOM));
+	obs_data_set_string(c, "focusMode", obs_data_get_string(settings, S_FOCUS_MODE));
+	obs_data_set_double(c, "lensPosition", obs_data_get_double(settings, S_LENS));
+	obs_data_set_string(c, "exposureMode", obs_data_get_string(settings, S_EXPOSURE_MODE));
+	obs_data_set_double(c, "exposureBias", obs_data_get_double(settings, S_EV));
+	obs_data_set_int(c, "iso", obs_data_get_int(settings, S_ISO));
+	obs_data_set_int(c, "shutterDenominator", obs_data_get_int(settings, S_SHUTTER));
+	obs_data_set_string(c, "whiteBalanceMode", obs_data_get_string(settings, S_WB_MODE));
+	obs_data_set_int(c, "temperature", obs_data_get_int(settings, S_TEMPERATURE));
+	obs_data_set_int(c, "tint", obs_data_get_int(settings, S_TINT));
+	obs_data_set_bool(c, "torch", obs_data_get_bool(settings, S_TORCH));
+	char *json = bstrdup(obs_data_get_json(c));
+	obs_data_release(c);
+	return json;
+}
+
+static void update_controls(struct iphone_camera *cam, obs_data_t *settings)
+{
+	char *json = build_controls_json(settings);
+	pthread_mutex_lock(&cam->mutex);
+	bool was_remote = cam->controls_json != NULL;
+	bool changed = (json == NULL) != (cam->controls_json == NULL) ||
+		       (json && strcmp(json, cam->controls_json) != 0);
+	bfree(cam->controls_json);
+	cam->controls_json = json;
+	pthread_mutex_unlock(&cam->mutex);
+
+	if (!changed || !cam->receiver)
+		return;
+	if (json)
+		obscam_receiver_send(cam->receiver, OBSCAM_MSG_CONTROLS, json, strlen(json));
+	else if (was_remote)
+		obscam_receiver_send(cam->receiver, OBSCAM_MSG_CONTROLS, NULL, 0); /* give control back */
 }
 
 static void iphone_camera_update(void *data, obs_data_t *settings)
@@ -367,6 +523,8 @@ static void iphone_camera_update(void *data, obs_data_t *settings)
 		snprintf(cam->usb_device, sizeof(cam->usb_device), "%s", usb_device);
 		start_receiver(cam);
 	}
+	/* A new receiver sends the controls itself once the app says hello. */
+	update_controls(cam, settings);
 }
 
 static void *iphone_camera_create(obs_data_t *settings, obs_source_t *source)
@@ -392,6 +550,8 @@ static void iphone_camera_destroy(void *data)
 	stop_receiver(cam);
 	obscam_decoder_destroy(cam->decoder);
 	pthread_mutex_destroy(&cam->mutex);
+	bfree(cam->caps_json);
+	bfree(cam->controls_json);
 	bfree(cam);
 }
 
@@ -401,6 +561,20 @@ static void iphone_camera_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_PORT, OBSCAM_DEFAULT_PORT);
 	obs_data_set_default_string(settings, S_USB_DEVICE, "");
 	obs_data_set_default_bool(settings, S_KEEP_LAST_FRAME, false);
+
+	/* Same defaults as CameraControls in the iOS app. */
+	obs_data_set_default_bool(settings, S_REMOTE, false);
+	obs_data_set_default_double(settings, S_ZOOM, 1.0);
+	obs_data_set_default_string(settings, S_FOCUS_MODE, CONTROL_AUTO);
+	obs_data_set_default_double(settings, S_LENS, 0.5);
+	obs_data_set_default_string(settings, S_EXPOSURE_MODE, CONTROL_AUTO);
+	obs_data_set_default_double(settings, S_EV, 0.0);
+	obs_data_set_default_int(settings, S_ISO, 100);
+	obs_data_set_default_int(settings, S_SHUTTER, 60);
+	obs_data_set_default_string(settings, S_WB_MODE, CONTROL_AUTO);
+	obs_data_set_default_int(settings, S_TEMPERATURE, 5000);
+	obs_data_set_default_int(settings, S_TINT, 0);
+	obs_data_set_default_bool(settings, S_TORCH, false);
 }
 
 static void append_local_addresses(struct dstr *out)
@@ -479,6 +653,117 @@ static void add_usb_device_list(obs_properties_t *props, struct iphone_camera *c
 		obs_property_list_add_string(list, cam->usb_device, cam->usb_device);
 }
 
+static bool is_mode(obs_data_t *settings, const char *key, const char *mode)
+{
+	return strcmp(obs_data_get_string(settings, key), mode) == 0;
+}
+
+static void set_visible(obs_properties_t *props, const char *name, bool visible)
+{
+	obs_property_t *p = obs_properties_get(props, name);
+	if (p)
+		obs_property_set_visible(p, visible);
+}
+
+/* Shows only the values that the chosen modes use. */
+static bool control_mode_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	(void)p;
+	set_visible(props, S_LENS, is_mode(settings, S_FOCUS_MODE, CONTROL_MANUAL));
+	set_visible(props, S_EV, is_mode(settings, S_EXPOSURE_MODE, CONTROL_AUTO));
+	set_visible(props, S_ISO, is_mode(settings, S_EXPOSURE_MODE, CONTROL_MANUAL));
+	set_visible(props, S_SHUTTER, is_mode(settings, S_EXPOSURE_MODE, CONTROL_MANUAL));
+	set_visible(props, S_TEMPERATURE, is_mode(settings, S_WB_MODE, CONTROL_MANUAL));
+	set_visible(props, S_TINT, is_mode(settings, S_WB_MODE, CONTROL_MANUAL));
+	return true;
+}
+
+static void add_mode_list(obs_properties_t *props, const char *name, const char *title, bool lock, bool manual)
+{
+	obs_property_t *list = obs_properties_add_list(props, name, title, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(list, T_("Control.Auto"), CONTROL_AUTO);
+	if (lock)
+		obs_property_list_add_string(list, T_("Control.Locked"), CONTROL_LOCKED);
+	if (manual)
+		obs_property_list_add_string(list, T_("Control.Manual"), CONTROL_MANUAL);
+	obs_property_set_modified_callback(list, control_mode_modified);
+}
+
+static void add_camera_controls(obs_properties_t *props, struct iphone_camera *cam)
+{
+	/* Until the app reports its camera, offer everything with generic ranges. */
+	struct camera_caps caps = {
+		.min_zoom = 1,
+		.max_zoom = 10,
+		.focus_lock = true,
+		.focus_manual = true,
+		.exposure_lock = true,
+		.exposure_manual = true,
+		.min_iso = 25,
+		.max_iso = 3200,
+		.min_bias = -3,
+		.max_bias = 3,
+		.wb_lock = true,
+		.wb_manual = true,
+		.torch = true,
+	};
+	if (cam) {
+		pthread_mutex_lock(&cam->mutex);
+		if (cam->caps.known)
+			caps = cam->caps;
+		pthread_mutex_unlock(&cam->mutex);
+	}
+	if (!caps.known) {
+		caps.shutter_count = sizeof(default_shutters) / sizeof(default_shutters[0]);
+		memcpy(caps.shutters, default_shutters, sizeof(default_shutters));
+	}
+
+	obs_properties_t *group = obs_properties_create();
+	obs_properties_add_group(props, S_REMOTE, T_("Control"), OBS_GROUP_CHECKABLE, group);
+
+	obs_property_t *info = obs_properties_add_text(
+		group, "control_info", T_(caps.known ? "Control.Info" : "Control.InfoNoCamera"), OBS_TEXT_INFO);
+	obs_property_text_set_info_type(info, OBS_TEXT_INFO_NORMAL);
+
+	if (caps.max_zoom > caps.min_zoom) {
+		obs_property_t *p =
+			obs_properties_add_float_slider(group, S_ZOOM, T_("Control.Zoom"), caps.min_zoom, caps.max_zoom, 0.1);
+		obs_property_float_set_suffix(p, "×");
+	}
+
+	add_mode_list(group, S_FOCUS_MODE, T_("Control.Focus"), caps.focus_lock, caps.focus_manual);
+	obs_properties_add_float_slider(group, S_LENS, T_("Control.LensPosition"), 0.0, 1.0, 0.01);
+
+	add_mode_list(group, S_EXPOSURE_MODE, T_("Control.Exposure"), caps.exposure_lock, caps.exposure_manual);
+	double min_bias = caps.min_bias > -3 ? caps.min_bias : -3;
+	double max_bias = caps.max_bias < 3 ? caps.max_bias : 3;
+	if (max_bias > min_bias) {
+		obs_property_t *p = obs_properties_add_float_slider(group, S_EV, T_("Control.ExposureBias"), min_bias,
+								    max_bias, 0.1);
+		obs_property_float_set_suffix(p, " EV");
+	}
+	if (caps.max_iso > caps.min_iso)
+		obs_properties_add_int_slider(group, S_ISO, T_("Control.ISO"), (int)caps.min_iso, (int)caps.max_iso, 1);
+	if (caps.shutter_count > 0) {
+		obs_property_t *list = obs_properties_add_list(group, S_SHUTTER, T_("Control.Shutter"),
+							       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+		for (size_t i = 0; i < caps.shutter_count; i++) {
+			char label[16];
+			snprintf(label, sizeof(label), "1/%d", caps.shutters[i]);
+			obs_property_list_add_int(list, label, caps.shutters[i]);
+		}
+	}
+
+	add_mode_list(group, S_WB_MODE, T_("Control.WhiteBalance"), caps.wb_lock, caps.wb_manual);
+	obs_property_t *temperature =
+		obs_properties_add_int_slider(group, S_TEMPERATURE, T_("Control.Temperature"), 2500, 8000, 50);
+	obs_property_int_set_suffix(temperature, " K");
+	obs_properties_add_int_slider(group, S_TINT, T_("Control.Tint"), -150, 150, 1);
+
+	if (caps.torch)
+		obs_properties_add_bool(group, S_TORCH, T_("Control.Torch"));
+}
+
 static obs_properties_t *iphone_camera_properties(void *data)
 {
 	struct iphone_camera *cam = data;
@@ -519,6 +804,7 @@ static obs_properties_t *iphone_camera_properties(void *data)
 	obs_properties_add_int(props, S_PORT, T_("Port"), 1024, 65535, 1);
 	add_usb_device_list(props, cam);
 	obs_properties_add_bool(props, S_KEEP_LAST_FRAME, T_("KeepLastFrame"));
+	add_camera_controls(props, cam);
 	return props;
 }
 

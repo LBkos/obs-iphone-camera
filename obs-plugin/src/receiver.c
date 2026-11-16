@@ -20,6 +20,13 @@
 #define CLIENT_TIMEOUT_MS 5000
 #define RECONNECT_INTERVAL_MS 1000
 #define READ_CHUNK (256 * 1024)
+/* Sends never block: OBS calls them from its graphics thread (source update).
+ * Messages to the phone are tiny, so a full send buffer means a dead link. */
+#ifdef MSG_NOSIGNAL
+#define SEND_FLAGS (MSG_NOSIGNAL | MSG_DONTWAIT)
+#else
+#define SEND_FLAGS MSG_DONTWAIT /* macOS: SO_NOSIGPIPE is set on the socket instead */
+#endif
 
 struct obscam_receiver {
 	struct obscam_receiver_callbacks cb;
@@ -39,7 +46,8 @@ struct obscam_receiver {
 	pthread_t thread;
 	int wake_pipe[2];
 	int listen_fd;
-	int client_fd;
+	int client_fd; /* written by the receiver thread under send_mutex */
+	pthread_mutex_t send_mutex;
 
 	uint8_t *buf;
 	size_t buf_len;
@@ -160,8 +168,10 @@ static void drop_client(struct obscam_receiver *r, const char *reason)
 	if (r->client_fd < 0)
 		return;
 	rlog(r, 0, "iPhone disconnected (%s)", reason);
+	pthread_mutex_lock(&r->send_mutex);
 	close(r->client_fd);
 	r->client_fd = -1;
+	pthread_mutex_unlock(&r->send_mutex);
 	r->buf_len = 0;
 	r->next_attempt_ms = now_ms() + RECONNECT_INTERVAL_MS;
 	set_status(r, OBSCAM_CLIENT_CONNECTING);
@@ -173,8 +183,14 @@ static void attach_client(struct obscam_receiver *r, int fd, const char *peer)
 {
 	int rcvbuf = 4 * 1024 * 1024;
 	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+#ifdef SO_NOSIGPIPE
+	int one = 1;
+	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
 
+	pthread_mutex_lock(&r->send_mutex);
 	r->client_fd = fd;
+	pthread_mutex_unlock(&r->send_mutex);
 	r->buf_len = 0;
 	r->last_rx_ms = now_ms();
 	set_status(r, OBSCAM_CLIENT_CONNECTED);
@@ -271,6 +287,10 @@ static bool handle_message(struct obscam_receiver *r, uint8_t type, const uint8_
 				    frames);
 		return true;
 	}
+	case OBSCAM_MSG_CAPABILITIES:
+		if (r->cb.capabilities)
+			r->cb.capabilities(r->cb.ctx, (const char *)payload, size);
+		return true;
 	default:
 		/* Unknown messages are skipped for forward compatibility. */
 		return true;
@@ -413,6 +433,7 @@ static void receiver_free(struct obscam_receiver *r)
 	if (r->free_ctx && r->connect_ctx)
 		r->free_ctx(r->connect_ctx);
 	pthread_mutex_destroy(&r->status_mutex);
+	pthread_mutex_destroy(&r->send_mutex);
 	free(r->buf);
 	free(r->service_name);
 	free(r);
@@ -429,6 +450,7 @@ static struct obscam_receiver *receiver_alloc(const struct obscam_receiver_callb
 	r->wake_pipe[0] = r->wake_pipe[1] = -1;
 	r->status = OBSCAM_CLIENT_CONNECTING;
 	pthread_mutex_init(&r->status_mutex, NULL);
+	pthread_mutex_init(&r->send_mutex, NULL);
 
 	if (pipe(r->wake_pipe) != 0) {
 		rlog(r, 2, "pipe() failed: %s", strerror(errno));
@@ -495,6 +517,40 @@ enum obscam_client_status obscam_receiver_client_status(obscam_receiver_t *r)
 	enum obscam_client_status status = r->status;
 	pthread_mutex_unlock(&r->status_mutex);
 	return status;
+}
+
+static bool send_all(int fd, const uint8_t *data, size_t size)
+{
+	while (size > 0) {
+		ssize_t n = send(fd, data, size, SEND_FLAGS);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		data += n;
+		size -= (size_t)n;
+	}
+	return true;
+}
+
+bool obscam_receiver_send(obscam_receiver_t *r, uint8_t type, const void *payload, size_t size)
+{
+	if (!r || size > OBSCAM_MAX_PAYLOAD)
+		return false;
+	uint8_t header[OBSCAM_HEADER_SIZE] = {type, (uint8_t)(size >> 24), (uint8_t)(size >> 16), (uint8_t)(size >> 8),
+					      (uint8_t)size};
+	pthread_mutex_lock(&r->send_mutex);
+	bool ok = r->client_fd >= 0;
+	if (ok) {
+		ok = send_all(r->client_fd, header, sizeof(header)) && (size == 0 || send_all(r->client_fd, payload, size));
+		/* A half-sent message would corrupt the stream: end the connection,
+		 * the receiver thread then reports the disconnect as usual. */
+		if (!ok)
+			shutdown(r->client_fd, SHUT_RDWR);
+	}
+	pthread_mutex_unlock(&r->send_mutex);
+	return ok;
 }
 
 void obscam_receiver_stop(obscam_receiver_t *r)

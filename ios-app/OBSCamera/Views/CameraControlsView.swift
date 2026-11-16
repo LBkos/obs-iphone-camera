@@ -11,91 +11,102 @@ struct CameraControlsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                if caps.maxZoom > caps.minZoom {
-                    Section("Зум") {
-                        VStack(alignment: .leading) {
-                            Text(String(format: "%.1f×", viewModel.controls.zoom))
-                            Slider(value: $viewModel.controls.zoom, in: caps.minZoom...caps.maxZoom)
-                        }
-                    }
-                }
-
-                Section {
-                    modePicker("Режим", selection: focusModeBinding,
-                               modes: modes(lock: caps.supportsFocusLock, manual: caps.supportsManualFocus))
-                    if viewModel.controls.focusMode == .manual {
-                        VStack(alignment: .leading) {
-                            Text("Дистанция: \(viewModel.controls.lensPosition, specifier: "%.2f")")
-                            Slider(value: $viewModel.controls.lensPosition, in: 0...1) {
-                                Text("Дистанция")
-                            } minimumValueLabel: {
-                                Image(systemName: "flower")
-                            } maximumValueLabel: {
-                                Image(systemName: "mountain.2")
-                            }
-                        }
-                    }
-                } header: {
-                    Text("Фокус")
-                } footer: {
-                    if viewModel.controls.focusMode == .auto {
-                        Text("Коснитесь превью, чтобы сфокусироваться на точке.")
-                    }
-                }
-
-                Section("Экспозиция") {
-                    modePicker("Режим", selection: exposureModeBinding,
-                               modes: modes(lock: caps.supportsExposureLock, manual: caps.supportsManualExposure))
-                    switch viewModel.controls.exposureMode {
-                    case .auto:
-                        if caps.maxExposureBias > caps.minExposureBias {
-                            VStack(alignment: .leading) {
-                                Text("Коррекция: \(viewModel.controls.exposureBias, specifier: "%+.1f") EV")
-                                Slider(value: $viewModel.controls.exposureBias,
-                                       in: max(caps.minExposureBias, -3)...min(caps.maxExposureBias, 3), step: 0.1)
-                            }
-                        }
-                    case .locked:
-                        EmptyView()
-                    case .manual:
-                        if caps.maxISO > caps.minISO {
-                            VStack(alignment: .leading) {
-                                Text("ISO: \(Int(viewModel.controls.iso))")
-                                Slider(value: $viewModel.controls.iso, in: caps.minISO...caps.maxISO, step: 1)
-                            }
-                        }
-                        if !caps.shutterDenominators.isEmpty {
-                            Picker("Выдержка", selection: $viewModel.controls.shutterDenominator) {
-                                ForEach(caps.shutterDenominators, id: \.self) { Text("1/\($0)").tag($0) }
-                            }
-                        }
-                    }
-                }
-
-                Section("Баланс белого") {
-                    modePicker("Режим", selection: whiteBalanceModeBinding,
-                               modes: modes(lock: caps.supportsWhiteBalanceLock, manual: caps.supportsManualWhiteBalance))
-                    if viewModel.controls.whiteBalanceMode == .manual {
-                        VStack(alignment: .leading) {
-                            Text("Температура: \(Int(viewModel.controls.temperature)) K")
-                            Slider(value: $viewModel.controls.temperature, in: CameraControls.temperatureRange, step: 50)
-                        }
-                        VStack(alignment: .leading) {
-                            Text("Оттенок: \(Int(viewModel.controls.tint))")
-                            Slider(value: $viewModel.controls.tint, in: CameraControls.tintRange, step: 1)
-                        }
-                    }
-                }
-
-                if caps.hasTorch {
+                if viewModel.isRemoteControlled {
                     Section {
-                        Toggle("Фонарик", isOn: $viewModel.controls.torch)
+                        Label("Камерой управляет OBS. Изменить настройки можно в свойствах источника «iPhone Camera».",
+                              systemImage: "desktopcomputer")
+                            .foregroundStyle(.secondary)
                     }
                 }
 
-                Section {
-                    Button("Сбросить всё на авто", role: .destructive, action: viewModel.resetControls)
+                Group {
+                    if caps.maxZoom > caps.minZoom {
+                        Section("Зум") {
+                            VStack(alignment: .leading) {
+                                Text(String(format: "%.1f×", viewModel.controls.zoom))
+                                Slider(value: $viewModel.controls.zoom, in: caps.minZoom...caps.maxZoom)
+                            }
+                        }
+                    }
+
+                    Section {
+                        modePicker("Режим", selection: focusModeBinding,
+                                   modes: modes(lock: caps.supportsFocusLock, manual: caps.supportsManualFocus))
+                        if viewModel.controls.focusMode == .manual {
+                            VStack(alignment: .leading) {
+                                Text("Дистанция: \(viewModel.controls.lensPosition, specifier: "%.2f")")
+                                Slider(value: $viewModel.controls.lensPosition, in: 0...1) {
+                                    Text("Дистанция")
+                                } minimumValueLabel: {
+                                    Image(systemName: "flower")
+                                } maximumValueLabel: {
+                                    Image(systemName: "mountain.2")
+                                }
+                            }
+                        }
+                    } header: {
+                        Text("Фокус")
+                    } footer: {
+                        if viewModel.controls.focusMode == .auto {
+                            Text("Коснитесь превью, чтобы сфокусироваться на точке.")
+                        }
+                    }
+
+                    Section("Экспозиция") {
+                        modePicker("Режим", selection: exposureModeBinding,
+                                   modes: modes(lock: caps.supportsExposureLock, manual: caps.supportsManualExposure))
+                        switch viewModel.controls.exposureMode {
+                        case .auto:
+                            if caps.maxExposureBias > caps.minExposureBias {
+                                VStack(alignment: .leading) {
+                                    Text("Коррекция: \(viewModel.controls.exposureBias, specifier: "%+.1f") EV")
+                                    Slider(value: $viewModel.controls.exposureBias,
+                                           in: max(caps.minExposureBias, -3)...min(caps.maxExposureBias, 3), step: 0.1)
+                                }
+                            }
+                        case .locked:
+                            EmptyView()
+                        case .manual:
+                            if caps.maxISO > caps.minISO {
+                                VStack(alignment: .leading) {
+                                    Text("ISO: \(Int(viewModel.controls.iso))")
+                                    Slider(value: $viewModel.controls.iso, in: caps.minISO...caps.maxISO, step: 1)
+                                }
+                            }
+                            if !caps.shutterDenominators.isEmpty {
+                                Picker("Выдержка", selection: $viewModel.controls.shutterDenominator) {
+                                    ForEach(caps.shutterDenominators, id: \.self) { Text("1/\($0)").tag($0) }
+                                }
+                            }
+                        }
+                    }
+
+                    Section("Баланс белого") {
+                        modePicker("Режим", selection: whiteBalanceModeBinding,
+                                   modes: modes(lock: caps.supportsWhiteBalanceLock, manual: caps.supportsManualWhiteBalance))
+                        if viewModel.controls.whiteBalanceMode == .manual {
+                            VStack(alignment: .leading) {
+                                Text("Температура: \(Int(viewModel.controls.temperature)) K")
+                                Slider(value: $viewModel.controls.temperature, in: CameraControls.temperatureRange, step: 50)
+                            }
+                            VStack(alignment: .leading) {
+                                Text("Оттенок: \(Int(viewModel.controls.tint))")
+                                Slider(value: $viewModel.controls.tint, in: CameraControls.tintRange, step: 1)
+                            }
+                        }
+                    }
+
+                    if caps.hasTorch {
+                        Section {
+                            Toggle("Фонарик", isOn: $viewModel.controls.torch)
+                        }
+                    }
+
+                    Section {
+                        Button("Сбросить всё на авто", role: .destructive, action: viewModel.resetControls)
+                    }
                 }
+                .disabled(viewModel.isRemoteControlled)
             }
             .navigationTitle("Камера")
             .navigationBarTitleDisplayMode(.inline)

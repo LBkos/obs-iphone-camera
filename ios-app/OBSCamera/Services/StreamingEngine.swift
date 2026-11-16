@@ -20,6 +20,8 @@ final class StreamingEngine: @unchecked Sendable {
 
     var statusHandler: ((Status) -> Void)?
     var statsHandler: ((Stats) -> Void)?
+    /// Camera controls sent by OBS; nil when OBS gives control back. Main queue.
+    var remoteControlsHandler: ((CameraControls?) -> Void)?
 
     let camera = CameraCaptureService()
     private let testPattern = TestPatternSource()
@@ -39,6 +41,7 @@ final class StreamingEngine: @unchecked Sendable {
     private var bytesSent = 0
     private var statsTimer: Timer?
     private var warnedAudioFormat = false
+    private var capabilities = CameraCapabilities()
 
     init() {
         encoder.outputHandler = { [weak self] frame in
@@ -105,6 +108,15 @@ final class StreamingEngine: @unchecked Sendable {
         }
         encoder.update(settings: settings)
         newSource.start(with: settings)
+    }
+
+    /// Tells OBS what the active camera supports (now and on every new connection).
+    func updateCapabilities(_ capabilities: CameraCapabilities) {
+        lock.lock()
+        self.capabilities = capabilities
+        let connection = isStreaming ? self.connection : nil
+        lock.unlock()
+        connection?.sendCapabilities(capabilities)
     }
 
     func stopCapture() {
@@ -178,6 +190,14 @@ final class StreamingEngine: @unchecked Sendable {
 
     private func start(_ connection: StreamConnection, hostName: String) {
         connection.keyframeNeededHandler = { [weak self] in self?.encoder.requestKeyframe() }
+        connection.controlsHandler = { [weak self, weak connection] controls in
+            guard let self, let connection else { return }
+            self.lock.lock()
+            let isCurrent = self.connection === connection
+            self.lock.unlock()
+            guard isCurrent else { return }
+            DispatchQueue.main.async { [weak self] in self?.remoteControlsHandler?(controls) }
+        }
         connection.bytesSentHandler = { [weak self] bytes in
             guard let self else { return }
             self.lock.lock()
@@ -213,7 +233,9 @@ final class StreamingEngine: @unchecked Sendable {
         case .ready:
             lock.lock()
             isStreaming = true
+            let capabilities = self.capabilities
             lock.unlock()
+            connection.sendCapabilities(capabilities)
             encoder.requestKeyframe()
             publish(.streaming(host: hostName))
         case .failed(let reason):

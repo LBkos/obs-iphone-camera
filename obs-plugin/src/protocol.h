@@ -1,7 +1,8 @@
 /*
  * Wire protocol shared by the iOS app (sender) and the OBS plugin (receiver).
  *
- * Transport: one TCP connection carrying iPhone -> OBS data.
+ * Transport: one TCP connection, mostly iPhone -> OBS data. OBS sends only
+ * CONTROLS (camera remote control).
  *   Wi-Fi: OBS listens (OBSCAM_DEFAULT_PORT), the iPhone connects.
  *   USB:   the iPhone listens (OBSCAM_USB_DEVICE_PORT), OBS connects via usbmuxd.
  * Every message:  [type: u8][length: u32 big-endian][payload: length bytes]
@@ -17,8 +18,21 @@
  *   AUDIO  (0x06)  payload: [pts_us: u64 BE][sample_rate: u32 BE][channels: u8]
  *                           [PCM, signed 16-bit little-endian, interleaved]
  *
- * For HEVC, CONFIG carries VPS + SPS + PPS. Unknown message types are skipped,
- * so a newer app still works with an older plugin (H.264, no audio).
+ *   CAPABILITIES (0x07)  iPhone -> OBS. payload: UTF-8 JSON, what the active camera
+ *                  supports (ranges, lock/manual support, torch). Sent after
+ *                  HELLO and every time the camera is reconfigured.
+ *                  Fields as in CameraCapabilities (Swift); shutterDenominators
+ *                  is an array of {"value": n} objects (shutter 1/n s), since
+ *                  obs_data can't read arrays of plain numbers.
+ *   CONTROLS (0x08)  OBS -> iPhone. payload: UTF-8 JSON with the camera controls
+ *                  (zoom, focusMode, lensPosition, exposureMode, exposureBias,
+ *                  iso, shutterDenominator, whiteBalanceMode, temperature,
+ *                  tint, torch; modes are "auto" / "locked" / "manual").
+ *                  While OBS sends these, the app's own controls are read-only.
+ *                  Empty payload: OBS gives control back to the app.
+ *
+ * For HEVC, CONFIG carries VPS + SPS + PPS. Unknown message types are skipped
+ * on both sides, so a newer app still works with an older plugin and back.
  *
  * Keep in sync with ios-app/OBSCamera/Models/WireProtocol.swift.
  */
@@ -37,6 +51,8 @@
 #define OBSCAM_MSG_PING 0x04
 #define OBSCAM_MSG_CODEC 0x05
 #define OBSCAM_MSG_AUDIO 0x06
+#define OBSCAM_MSG_CAPABILITIES 0x07
+#define OBSCAM_MSG_CONTROLS 0x08
 
 #define OBSCAM_CODEC_H264 0
 #define OBSCAM_CODEC_HEVC 1

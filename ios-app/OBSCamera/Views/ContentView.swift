@@ -139,13 +139,12 @@ struct ContentView: View {
                 Spacer()
                 if isCameraPreview {
                     if viewModel.capabilities.hasTorch {
-                        Button {
-                            viewModel.controls.torch.toggle()
-                        } label: {
+                        Button(action: viewModel.toggleTorch) {
                             Image(systemName: viewModel.controls.torch ? "flashlight.on.fill" : "flashlight.off.fill")
                                 .font(.title3)
                         }
                         .accessibilityLabel(viewModel.controls.torch ? "Выключить фонарик" : "Включить фонарик")
+                        .disabled(viewModel.isRemoteControlled)
                     }
                     Button {
                         activeSheet = .cameraControls

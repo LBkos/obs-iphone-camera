@@ -28,6 +28,8 @@ struct obscam_receiver_callbacks {
 	/* pcm: interleaved signed 16-bit little-endian; frames = samples per channel. */
 	void (*audio)(void *ctx, uint64_t pts_us, uint32_t sample_rate, uint8_t channels, const uint8_t *pcm,
 		      size_t frames);
+	/* UTF-8 JSON, not NUL-terminated (see OBSCAM_MSG_CAPABILITIES). */
+	void (*capabilities)(void *ctx, const char *json, size_t size);
 	void (*disconnected)(void *ctx);
 	obscam_log_fn log; /* level: 0 = info, 1 = warning, 2 = error */
 };
@@ -57,5 +59,10 @@ obscam_receiver_t *obscam_receiver_start_client(obscam_connect_fn connect_fn, vo
 
 /* Latest client-mode status (OBSCAM_CLIENT_CONNECTED in server mode while a phone is connected). */
 enum obscam_client_status obscam_receiver_client_status(obscam_receiver_t *receiver);
+
+/* Sends one message to the connected iPhone. Thread-safe, also from the
+ * callbacks. Returns false when no iPhone is connected or the send failed
+ * (a failed send closes the connection). */
+bool obscam_receiver_send(obscam_receiver_t *receiver, uint8_t type, const void *payload, size_t size);
 
 void obscam_receiver_stop(obscam_receiver_t *receiver);
