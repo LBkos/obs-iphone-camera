@@ -131,7 +131,7 @@ struct StreamSettings: Codable, Equatable {
     var resolution: VideoResolution = .hd1080
     var frameRate: Int = 30
     var bitrateMbps: Double = 8
-    var orientation: VideoOrientation = .landscape
+    var orientation: VideoOrientation = .portrait
     var codec: VideoCodec = .h264
     var h264Profile: H264Profile = .high
     /// Seconds between keyframes.

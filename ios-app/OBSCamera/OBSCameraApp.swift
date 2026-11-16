@@ -18,7 +18,7 @@ struct OBSCameraApp: App {
 /// rotation: the preview angle is then fixed, and turning the phone never
 /// changes what OBS receives.
 final class AppDelegate: NSObject, UIApplicationDelegate {
-    @MainActor static var allowedOrientations: UIInterfaceOrientationMask = .landscapeRight
+    @MainActor static var allowedOrientations: UIInterfaceOrientationMask = .portrait
 
     func application(_ application: UIApplication,
                      supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
