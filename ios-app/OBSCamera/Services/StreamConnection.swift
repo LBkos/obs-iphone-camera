@@ -18,6 +18,8 @@ final class StreamConnection: @unchecked Sendable {
     var keyframeNeededHandler: (() -> Void)?
     /// Called for every sent byte count (for statistics).
     var bytesSentHandler: ((Int) -> Void)?
+    /// Camera controls from OBS (nil = OBS gave control back), on the connection queue.
+    var controlsHandler: ((CameraControls?) -> Void)?
 
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "com.obscamera.connection", qos: .userInteractive)
@@ -30,6 +32,7 @@ final class StreamConnection: @unchecked Sendable {
     private var droppingUntilKeyframe = false
     private var lastSendTime = DispatchTime.now()
     private var pingTimer: DispatchSourceTimer?
+    private var receiveBuffer = Data()
 
     private let maxBytesInFlight = 2_000_000
 
@@ -97,6 +100,13 @@ final class StreamConnection: @unchecked Sendable {
         }
     }
 
+    func sendCapabilities(_ caps: CameraCapabilities) {
+        queue.async { [self] in
+            guard isReady else { return }
+            write(WireProtocol.capabilitiesMessage(caps))
+        }
+    }
+
     /// Interleaved signed 16-bit little-endian PCM.
     func sendAudio(pcm: Data, ptsMicros: UInt64, sampleRate: UInt32, channels: UInt8) {
         queue.async { [self] in
@@ -120,9 +130,10 @@ final class StreamConnection: @unchecked Sendable {
             isReady = true
             bytesInFlight = 0
             droppingUntilKeyframe = false
+            receiveBuffer.removeAll()
             write(WireProtocol.message(.hello, payload: Data(deviceName.utf8)))
             startPing()
-            watchForClose()
+            receive()
             logger.info("Connected to \(String(describing: self.connection.endpoint), privacy: .public)")
             stateHandler?(.ready)
         case .failed(let error):
@@ -137,18 +148,55 @@ final class StreamConnection: @unchecked Sendable {
         }
     }
 
-    /// OBS never sends data; a completed receive means it closed the connection.
-    private func watchForClose() {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] _, _, isComplete, error in
+    /// Reads messages from OBS (camera controls). A completed receive means OBS closed the connection.
+    private func receive() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, isComplete, error in
             guard let self, self.isReady else { return }
+            if let data, !data.isEmpty {
+                self.receiveBuffer.append(data)
+                guard self.parseMessages() else {
+                    self.fail("Invalid data from OBS")
+                    return
+                }
+            }
             if isComplete || error != nil {
-                self.isReady = false
                 self.logger.info("OBS closed the connection")
-                self.stateHandler?(.failed(error?.localizedDescription ?? "Connection closed by OBS"))
+                self.fail(error?.localizedDescription ?? "Connection closed by OBS")
             } else {
-                self.watchForClose()
+                self.receive()
             }
         }
+    }
+
+    private func fail(_ reason: String) {
+        isReady = false
+        stateHandler?(.failed(reason))
+    }
+
+    /// Returns false on a protocol error.
+    private func parseMessages() -> Bool {
+        while receiveBuffer.count >= WireProtocol.headerSize {
+            let start = receiveBuffer.startIndex
+            let length = receiveBuffer[(start + 1)..<(start + 5)].reduce(0) { (result: Int, byte: UInt8) in result << 8 | Int(byte) }
+            guard length <= WireProtocol.maxIncomingPayload else {
+                logger.error("Message from OBS too large (\(length) bytes)")
+                return false
+            }
+            guard receiveBuffer.count >= WireProtocol.headerSize + length else { break }
+            let type = receiveBuffer[start]
+            let payload = Data(receiveBuffer[(start + WireProtocol.headerSize)..<(start + WireProtocol.headerSize + length)])
+            receiveBuffer.removeFirst(WireProtocol.headerSize + length)
+
+            // Unknown types are skipped, for newer plugins.
+            if type == WireProtocol.MessageType.controls.rawValue {
+                do {
+                    controlsHandler?(try WireProtocol.decodeControls(payload))
+                } catch {
+                    logger.error("Invalid controls from OBS: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+        }
+        return true
     }
 
     private func write(_ data: Data) {

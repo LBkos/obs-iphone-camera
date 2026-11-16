@@ -3,7 +3,10 @@
  * prints statistics. Useful to test the app/network before touching OBS.
  *
  *   obscam-receiver-test [--port 47100 | --usb [UDID] | --connect HOST:PORT]
- *                        [--frames N] [--snapshot out.ppm]
+ *                        [--frames N] [--snapshot out.ppm] [--control JSON]
+ *
+ * --control sends a CONTROLS message (see protocol.h) after each HELLO, e.g.
+ *   --control '{"zoom":2,"exposureMode":"manual","iso":400,"shutterDenominator":100}'
  */
 #include "h264-decoder.h"
 #include "protocol.h"
@@ -31,6 +34,8 @@ static unsigned g_frames_limit;
 static const char *g_snapshot_path;
 static bool g_snapshot_done;
 static int g_width, g_height;
+static obscam_receiver_t *_Atomic g_receiver;
+static const char *g_control_json;
 
 static void on_signal(int sig)
 {
@@ -50,6 +55,23 @@ static void on_connected(void *ctx, const char *peer)
 	(void)ctx;
 	(void)peer;
 	obscam_decoder_reset(g_decoder);
+}
+
+static void on_hello(void *ctx, const char *name)
+{
+	(void)ctx;
+	(void)name;
+	if (!g_control_json)
+		return;
+	bool sent = obscam_receiver_send(atomic_load(&g_receiver), OBSCAM_MSG_CONTROLS, g_control_json,
+					 strlen(g_control_json));
+	fprintf(stderr, "[info] controls %s\n", sent ? "sent" : "NOT sent");
+}
+
+static void on_capabilities(void *ctx, const char *json, size_t size)
+{
+	(void)ctx;
+	fprintf(stderr, "[info] capabilities: %.*s\n", (int)size, json);
 }
 
 static void on_codec(void *ctx, uint8_t codec)
@@ -206,9 +228,12 @@ int main(int argc, char **argv)
 				usb_udid = argv[++i];
 		} else if (!strcmp(argv[i], "--connect") && i + 1 < argc)
 			connect_to = argv[++i];
+		else if (!strcmp(argv[i], "--control") && i + 1 < argc)
+			g_control_json = argv[++i];
 		else {
 			fprintf(stderr,
 				"usage: %s [--port N | --usb [UDID] | --connect HOST:PORT] [--frames N] [--snapshot out.ppm]\n"
+				"       [--control JSON]\n"
 				"  default      Wi-Fi mode: listen on port N (47100) and advertise via Bonjour\n"
 				"  --usb        USB mode: connect to the app through usbmuxd (device port %d)\n"
 				"  --connect    connect to the app's USB-mode listener over plain TCP (Simulator)\n",
@@ -228,6 +253,8 @@ int main(int argc, char **argv)
 
 	struct obscam_receiver_callbacks cb = {
 		.connected = on_connected,
+		.hello = on_hello,
+		.capabilities = on_capabilities,
 		.codec = on_codec,
 		.config = on_config,
 		.frame = on_frame,
@@ -245,6 +272,7 @@ int main(int argc, char **argv)
 		r = obscam_receiver_start((uint16_t)port, "OBS Camera receiver test", &cb);
 	if (!r)
 		return 1;
+	atomic_store(&g_receiver, r);
 
 	unsigned last = 0, last_audio = 0;
 	while (!atomic_load(&g_stop)) {

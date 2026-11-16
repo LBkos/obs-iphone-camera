@@ -15,6 +15,9 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var focusIndicator: CGPoint?
     /// Black screen while streaming: the phone's display is not needed then.
     @Published private(set) var isScreenBlack = false
+    /// OBS controls the camera (its source has "Control the camera from OBS" on):
+    /// the app's own camera controls are read-only meanwhile.
+    @Published private(set) var isRemoteControlled = false
     /// Last connection error while auto-reconnecting.
     @Published private(set) var reconnectError: String?
     @Published var settings: StreamSettings {
@@ -72,10 +75,16 @@ final class CameraViewModel: ObservableObject {
             Task { @MainActor in self?.discoveryError = message }
         }
         engine.camera.capabilitiesHandler = { [weak self] capabilities in
-            Task { @MainActor in self?.capabilities = capabilities }
+            Task { @MainActor in
+                self?.capabilities = capabilities
+                self?.engine.updateCapabilities(capabilities)
+            }
         }
         engine.camera.controlsChangedHandler = { [weak self] controls in
-            Task { @MainActor in self?.controls = controls }
+            Task { @MainActor in self?.cameraControlButtonChanged(controls) }
+        }
+        engine.remoteControlsHandler = { [weak self] controls in
+            Task { @MainActor in self?.handleRemoteControls(controls) }
         }
     }
 
@@ -160,7 +169,8 @@ final class CameraViewModel: ObservableObject {
             browser.stop()
             exitBlackScreen() // brightness is system-wide: give it back
             // The torch turns off with the camera; don't switch it on again by surprise.
-            controls.torch = false
+            // Under OBS control it follows OBS instead.
+            if !isRemoteControlled { controls.torch = false }
         default:
             break
         }
@@ -170,6 +180,7 @@ final class CameraViewModel: ObservableObject {
 
     /// Pinch on the preview. `scale` is relative to the pinch start; nil ends the pinch.
     func pinchZoom(scale: CGFloat?) {
+        guard !isRemoteControlled else { return }
         guard let scale else {
             zoomAtPinchStart = nil
             return
@@ -181,7 +192,7 @@ final class CameraViewModel: ObservableObject {
 
     /// Tap on the preview: focus/expose there (for the parts in auto mode).
     func tapToFocus(devicePoint: CGPoint, previewPoint: CGPoint) {
-        guard controls.focusMode == .auto || controls.exposureMode == .auto else { return }
+        guard !isRemoteControlled, controls.focusMode == .auto || controls.exposureMode == .auto else { return }
         engine.camera.focus(atDevicePoint: devicePoint)
         focusIndicator = previewPoint
         focusIndicatorTask?.cancel()
@@ -230,6 +241,11 @@ final class CameraViewModel: ObservableObject {
         controls = updated
     }
 
+    func toggleTorch() {
+        guard !isRemoteControlled else { return }
+        controls.torch.toggle()
+    }
+
     func resetControls() {
         var reset = CameraControls()
         reset.torch = controls.torch
@@ -268,8 +284,31 @@ final class CameraViewModel: ObservableObject {
 
     // MARK: - Private
 
+    private func handleRemoteControls(_ remote: CameraControls?) {
+        guard let remote else {
+            isRemoteControlled = false
+            return
+        }
+        isRemoteControlled = true
+        controls = remote
+    }
+
+    /// The Camera Control button (iPhone 16+) changes the camera directly.
+    private func cameraControlButtonChanged(_ changed: CameraControls) {
+        if isRemoteControlled {
+            engine.camera.apply(controls) // OBS decides: undo the change
+        } else {
+            controls = changed
+        }
+    }
+
     private func handle(_ status: StreamingEngine.Status) {
         reconnectTask?.cancel()
+        // Control returns to the app as soon as OBS is gone.
+        switch status {
+        case .streaming: break
+        default: isRemoteControlled = false
+        }
         if case .failed(let reason) = status, let host = lastHost {
             // OBS restarted, Wi-Fi blip, etc.: keep trying until the user taps "Disconnect".
             self.status = .connecting(host: host.name)
