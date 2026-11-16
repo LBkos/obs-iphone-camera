@@ -1,10 +1,13 @@
 import SwiftUI
 
+/// "Дополнительно": the rarely changed settings, in a sheet over the camera.
+/// Resolution and frame rate are in the top bar of the main screen.
 struct SettingsView: View {
     @ObservedObject var viewModel: CameraViewModel
     @Environment(\.dismiss) private var dismiss
     @AppStorage(DisplayOptions.showGridKey) private var showGrid = false
     @AppStorage(DisplayOptions.showLevelKey) private var showLevel = false
+    @AppStorage(DisplayOptions.autoBlackScreenKey) private var autoBlackScreen = true
 
     private var settings: StreamSettings { viewModel.settings }
 
@@ -18,7 +21,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Источник") {
+                Section {
                     Picker("Камера", selection: $viewModel.settings.source) {
                         ForEach(sources) { Text($0.title).tag($0) }
                     }
@@ -29,15 +32,13 @@ struct SettingsView: View {
                     if isCamera {
                         Toggle("Отразить изображение", isOn: $viewModel.settings.mirror)
                     }
+                } header: {
+                    Text("Источник")
+                } footer: {
+                    Text("Экран поворачивается вместе с видео. Горизонтально: держите iPhone разъёмом зарядки вправо.")
                 }
 
                 Section {
-                    Picker("Разрешение", selection: $viewModel.settings.resolution) {
-                        ForEach(VideoResolution.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    Picker("Частота кадров", selection: $viewModel.settings.frameRate) {
-                        ForEach(StreamSettings.supportedFrameRates, id: \.self) { Text("\($0) fps").tag($0) }
-                    }
                     VStack(alignment: .leading) {
                         Text("Битрейт: \(settings.bitrateMbps, specifier: "%.0f") Мбит/с")
                         Slider(value: $viewModel.settings.bitrateMbps, in: StreamSettings.bitrateRange, step: 1)
@@ -45,8 +46,8 @@ struct SettingsView: View {
                 } header: {
                     Text("Видео")
                 } footer: {
-                    if isCamera && !CameraCaptureService.supportsFormat(for: settings) {
-                        Text("Эта камера не снимает \(settings.resolution.rawValue) при \(settings.frameRate) fps. Будет использован ближайший стандартный режим.")
+                    if !viewModel.isFormatSupported {
+                        Text("Эта камера не снимает \(settings.resolution.rawValue) при \(settings.frameRate) fps (оранжевым сверху). Будет использован ближайший стандартный режим.")
                             .foregroundStyle(.orange)
                     }
                 }
@@ -82,6 +83,8 @@ struct SettingsView: View {
                         if viewModel.capabilities.supportsLowLightBoost {
                             Toggle("Усиление при слабом свете", isOn: $viewModel.settings.lowLightBoost)
                         }
+                        Button("Сбросить фокус, экспозицию и баланс на авто", action: viewModel.resetControls)
+                            .disabled(viewModel.isRemoteControlled)
                     } header: {
                         Text("Камера")
                     } footer: {
@@ -104,18 +107,24 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("Превью") {
+                Section {
+                    Toggle("Гасить экран через 30 с в эфире", isOn: $autoBlackScreen)
                     Toggle("Сетка", isOn: $showGrid)
                     Toggle("Уровень горизонта", isOn: $showLevel)
+                } header: {
+                    Text("Экран")
+                } footer: {
+                    Text("Для штатива: видео продолжает идти, а экран не греется и не тратит батарею. Вернуть экран: двойное касание.")
                 }
 
                 Section {
-                    Text("Горизонтальная ориентация: держите iPhone боком, разъёмом зарядки вправо. Если сеть не справляется, уменьшите битрейт или разрешение. Кнопка с луной выключает экран, видео при этом продолжает идти.")
+                    Text("Если сеть не справляется, уменьшите битрейт или разрешение (сверху справа на главном экране).")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("Настройки")
+            .tint(Color.brand)
+            .navigationTitle("Дополнительно")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {

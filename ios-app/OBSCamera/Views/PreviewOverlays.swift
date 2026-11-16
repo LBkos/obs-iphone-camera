@@ -5,6 +5,12 @@ import SwiftUI
 enum DisplayOptions {
     static let showGridKey = "showGrid"
     static let showLevelKey = "showLevel"
+    /// Black screen 30 s after going live (for a phone on a tripod). On by default.
+    static let autoBlackScreenKey = "autoBlackScreen"
+
+    static var autoBlackScreen: Bool {
+        UserDefaults.standard.object(forKey: autoBlackScreenKey) as? Bool ?? true
+    }
 }
 
 /// Rule-of-thirds grid over the video area of the preview.
@@ -39,14 +45,15 @@ struct LevelOverlay: View {
         Group {
             if let roll = monitor.roll {
                 // Level when the screen's "down" points straight down: 0° in portrait,
-                // -90° held sideways (charging port to the right).
+                // -90° held sideways (charging port to the right). The interface turns
+                // with the stream orientation, so the target is "flat" on screen.
                 let target = orientation == .portrait ? 0 : -Double.pi / 2
                 let isLevel = abs(roll - target) < 1 * .pi / 180
                 Capsule()
                     .fill(isLevel ? Color.green : Color.white.opacity(0.8))
                     .frame(width: 160, height: 3)
                     // The line stays parallel to the real horizon.
-                    .rotationEffect(.radians(-roll))
+                    .rotationEffect(.radians(-(roll - target)))
                     .animation(.linear(duration: 0.1), value: roll)
             }
         }
@@ -78,13 +85,13 @@ private final class LevelMonitor: ObservableObject {
     }
 }
 
-/// Yellow square where the user tapped to focus.
+/// Square where the user tapped to focus.
 struct FocusIndicator: View {
     let point: CGPoint
 
     var body: some View {
         RoundedRectangle(cornerRadius: 4)
-            .stroke(Color.yellow, lineWidth: 1.5)
+            .stroke(Color.brand, lineWidth: 1.5)
             .frame(width: 70, height: 70)
             .position(point)
             .allowsHitTesting(false)
