@@ -22,6 +22,7 @@ targets:
         UILaunchScreen: {}
         UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationLandscapeRight
           - UIInterfaceOrientationPortrait
         UIApplicationSupportsIndirectInputEvents: true
         NSCameraUsageDescription: "Камера передаёт видео в OBS на вашем компьютере."
