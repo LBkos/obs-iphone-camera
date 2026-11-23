@@ -20,6 +20,17 @@ enum VideoSourceKind: String, CaseIterable, Identifiable, Codable {
         case .testPattern: "Тестовая картинка"
         }
     }
+
+    /// For the lens button on the preview.
+    var shortTitle: String {
+        switch self {
+        case .backCamera: "Основная"
+        case .backUltraWide: "Сверхширокая"
+        case .backTelephoto: "Теле"
+        case .frontCamera: "Фронтальная"
+        case .testPattern: "Тест"
+        }
+    }
 }
 
 enum VideoResolution: String, CaseIterable, Identifiable, Codable {

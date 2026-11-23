@@ -45,6 +45,8 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-iphone-camera", "en-US")
 #define S_TEMPERATURE "cc_temperature"
 #define S_TINT "cc_tint"
 #define S_TORCH "cc_torch"
+/* Not a setting to keep: picking a profile copies its values into the ones above. */
+#define S_PROFILE "cc_profile"
 
 #define CONTROL_AUTO "auto"
 #define CONTROL_LOCKED "locked"
@@ -575,6 +577,7 @@ static void iphone_camera_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_TEMPERATURE, 5000);
 	obs_data_set_default_int(settings, S_TINT, 0);
 	obs_data_set_default_bool(settings, S_TORCH, false);
+	obs_data_set_default_string(settings, S_PROFILE, "");
 }
 
 static void append_local_addresses(struct dstr *out)
@@ -665,6 +668,29 @@ static void set_visible(obs_properties_t *props, const char *name, bool visible)
 		obs_property_set_visible(p, visible);
 }
 
+/* Profiles the app sent (CAPABILITIES "profiles"), NULL if none. Release with obs_data_array_release. */
+static obs_data_array_t *get_profiles(struct iphone_camera *cam)
+{
+	if (!cam)
+		return NULL;
+	pthread_mutex_lock(&cam->mutex);
+	char *json = cam->caps_json ? bstrdup(cam->caps_json) : NULL;
+	pthread_mutex_unlock(&cam->mutex);
+	if (!json)
+		return NULL;
+	obs_data_t *data = obs_data_create_from_json(json);
+	bfree(json);
+	if (!data)
+		return NULL;
+	obs_data_array_t *profiles = obs_data_get_array(data, "profiles");
+	obs_data_release(data);
+	if (profiles && obs_data_array_count(profiles) == 0) {
+		obs_data_array_release(profiles);
+		return NULL;
+	}
+	return profiles;
+}
+
 /* Shows only the values that the chosen modes use. */
 static bool control_mode_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
@@ -676,6 +702,67 @@ static bool control_mode_modified(obs_properties_t *props, obs_property_t *p, ob
 	set_visible(props, S_TEMPERATURE, is_mode(settings, S_WB_MODE, CONTROL_MANUAL));
 	set_visible(props, S_TINT, is_mode(settings, S_WB_MODE, CONTROL_MANUAL));
 	return true;
+}
+
+/*
+ * A profile was picked: copy its camera values into the controls (only these,
+ * never the format, so the video doesn't restart), then reset the list so it
+ * works like a button and reopening the properties doesn't apply it again.
+ */
+static bool profile_modified(void *priv, obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	(void)p;
+	const char *id = obs_data_get_string(settings, S_PROFILE);
+	if (!id[0])
+		return false;
+
+	obs_data_array_t *profiles = get_profiles(priv);
+	size_t count = obs_data_array_count(profiles);
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *profile = obs_data_array_item(profiles, i);
+		if (strcmp(obs_data_get_string(profile, "id"), id) == 0) {
+			obs_data_t *c = obs_data_get_obj(profile, "controls");
+			if (c) {
+				obs_data_set_double(settings, S_ZOOM, obs_data_get_double(c, "zoom"));
+				obs_data_set_string(settings, S_FOCUS_MODE, obs_data_get_string(c, "focusMode"));
+				obs_data_set_double(settings, S_LENS, obs_data_get_double(c, "lensPosition"));
+				obs_data_set_string(settings, S_EXPOSURE_MODE, obs_data_get_string(c, "exposureMode"));
+				obs_data_set_double(settings, S_EV, obs_data_get_double(c, "exposureBias"));
+				obs_data_set_int(settings, S_ISO, (long long)obs_data_get_double(c, "iso"));
+				obs_data_set_int(settings, S_SHUTTER, obs_data_get_int(c, "shutterDenominator"));
+				obs_data_set_string(settings, S_WB_MODE, obs_data_get_string(c, "whiteBalanceMode"));
+				obs_data_set_int(settings, S_TEMPERATURE, (long long)obs_data_get_double(c, "temperature"));
+				obs_data_set_int(settings, S_TINT, (long long)obs_data_get_double(c, "tint"));
+				obs_data_release(c);
+			}
+		}
+		obs_data_release(profile);
+	}
+	obs_data_array_release(profiles);
+
+	obs_data_set_string(settings, S_PROFILE, "");
+	control_mode_modified(props, NULL, settings);
+	return true;
+}
+
+static void add_profile_list(obs_properties_t *props, struct iphone_camera *cam)
+{
+	obs_data_array_t *profiles = get_profiles(cam);
+	if (!profiles)
+		return;
+	obs_property_t *list = obs_properties_add_list(props, S_PROFILE, T_("Control.Profile"), OBS_COMBO_TYPE_LIST,
+						       OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(list, T_("Control.Profile.Choose"), "");
+	size_t count = obs_data_array_count(profiles);
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *profile = obs_data_array_item(profiles, i);
+		const char *id = obs_data_get_string(profile, "id");
+		if (id[0])
+			obs_property_list_add_string(list, obs_data_get_string(profile, "name"), id);
+		obs_data_release(profile);
+	}
+	obs_data_array_release(profiles);
+	obs_property_set_modified_callback2(list, profile_modified, cam);
 }
 
 static void add_mode_list(obs_properties_t *props, const char *name, const char *title, bool lock, bool manual)
@@ -724,6 +811,8 @@ static void add_camera_controls(obs_properties_t *props, struct iphone_camera *c
 	obs_property_t *info = obs_properties_add_text(
 		group, "control_info", T_(caps.known ? "Control.Info" : "Control.InfoNoCamera"), OBS_TEXT_INFO);
 	obs_property_text_set_info_type(info, OBS_TEXT_INFO_NORMAL);
+
+	add_profile_list(group, cam);
 
 	if (caps.max_zoom > caps.min_zoom) {
 		obs_property_t *p =

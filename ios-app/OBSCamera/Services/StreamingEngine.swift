@@ -16,6 +16,8 @@ final class StreamingEngine: @unchecked Sendable {
     struct Stats: Equatable {
         var framesPerSecond = 0
         var kilobitsPerSecond = 0
+        /// Frames dropped in the last second because the network couldn't keep up.
+        var droppedFrames = 0
     }
 
     var statusHandler: ((Status) -> Void)?
@@ -41,9 +43,11 @@ final class StreamingEngine: @unchecked Sendable {
     private var settings = StreamSettings()
     private var framesSent = 0
     private var bytesSent = 0
+    private var framesDropped = 0
     private var statsTimer: Timer?
     private var warnedAudioFormat = false
     private var capabilities = CameraCapabilities()
+    private var profiles: [CameraProfile] = []
 
     init() {
         encoder.outputHandler = { [weak self] frame in
@@ -116,9 +120,20 @@ final class StreamingEngine: @unchecked Sendable {
     func updateCapabilities(_ capabilities: CameraCapabilities) {
         lock.lock()
         self.capabilities = capabilities
+        let profiles = self.profiles
         let connection = isStreaming ? self.connection : nil
         lock.unlock()
-        connection?.sendCapabilities(capabilities)
+        connection?.sendCapabilities(capabilities, profiles: profiles)
+    }
+
+    /// Profiles OBS can pick from (sent along with the capabilities).
+    func updateProfiles(_ profiles: [CameraProfile]) {
+        lock.lock()
+        self.profiles = profiles
+        let capabilities = self.capabilities
+        let connection = isStreaming ? self.connection : nil
+        lock.unlock()
+        connection?.sendCapabilities(capabilities, profiles: profiles)
     }
 
     func stopCapture() {
@@ -205,6 +220,12 @@ final class StreamingEngine: @unchecked Sendable {
             self.bytesSent += bytes
             self.lock.unlock()
         }
+        connection.frameDroppedHandler = { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.framesDropped += 1
+            self.lock.unlock()
+        }
         connection.stateHandler = { [weak self, weak connection] state in
             guard let self, let connection else { return }
             self.handle(state, of: connection, hostName: hostName, viaUSB: viaUSB)
@@ -236,8 +257,9 @@ final class StreamingEngine: @unchecked Sendable {
             lock.lock()
             isStreaming = true
             let capabilities = self.capabilities
+            let profiles = self.profiles
             lock.unlock()
-            connection.sendCapabilities(capabilities)
+            connection.sendCapabilities(capabilities, profiles: profiles)
             encoder.requestKeyframe()
             publish(.streaming(host: hostName, viaUSB: viaUSB))
         case .failed(let reason):
@@ -265,9 +287,11 @@ final class StreamingEngine: @unchecked Sendable {
             self.statsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 self.lock.lock()
-                let stats = Stats(framesPerSecond: self.framesSent, kilobitsPerSecond: self.bytesSent * 8 / 1000)
+                let stats = Stats(framesPerSecond: self.framesSent, kilobitsPerSecond: self.bytesSent * 8 / 1000,
+                                  droppedFrames: self.framesDropped)
                 self.framesSent = 0
                 self.bytesSent = 0
+                self.framesDropped = 0
                 self.lock.unlock()
                 self.statsHandler?(stats)
             }

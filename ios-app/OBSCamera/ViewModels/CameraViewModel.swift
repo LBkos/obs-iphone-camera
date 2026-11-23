@@ -2,23 +2,16 @@ import AVFoundation
 import SwiftUI
 import UIKit
 
-/// A zoom bubble on the preview: the ultra-wide camera or a zoom step of the main camera.
-struct LensOption: Identifiable, Equatable {
-    let id: String
-    let source: VideoSourceKind
-    let zoom: Double
-    let label: String
-    let isSelected: Bool
-}
-
 @MainActor
 final class CameraViewModel: ObservableObject {
-    /// State of the big live button.
-    enum LivePhase {
-        case idle, waiting, live
+    /// Dot in the connection line at the bottom.
+    enum ConnectionQuality {
+        case none, good, weak, bad
     }
 
     static let manualTargetID = "manual"
+    /// The screen turns black this long after going live (if the option is on).
+    static let autoBlackSeconds = 30
 
     @Published private(set) var hosts: [OBSHost] = []
     @Published private(set) var status: StreamingEngine.Status = .idle
@@ -41,15 +34,18 @@ final class CameraViewModel: ObservableObject {
     /// OBS can connect through the cable. Off after the user stops the stream,
     /// so the USB source doesn't restart it right away.
     @Published private(set) var isUSBListening = false
-    /// Computer under the preview: an `OBSHost.id` or `manualTargetID`.
+    /// Computer to stream to over Wi‑Fi: an `OBSHost.id` or `manualTargetID`.
     @Published var selectedTargetID: String?
+    @Published private(set) var profiles: [CameraProfile] {
+        didSet {
+            CameraProfile.saveAll(profiles)
+            engine.updateProfiles(profiles)
+        }
+    }
     @Published var settings: StreamSettings {
         didSet {
             guard settings != oldValue else { return }
             settings.save()
-            if settings.orientation != oldValue.orientation {
-                InterfaceOrientation.lock(to: settings.orientation)
-            }
             applySettings()
         }
     }
@@ -76,12 +72,13 @@ final class CameraViewModel: ObservableObject {
     private var brightnessBeforeBlack: CGFloat?
     private static let manualAddressKey = "manualAddress"
     private static let lastHostNameKey = "lastHostName"
-    private static let autoBlackDelay: Duration = .seconds(30)
 
     init() {
         settings = StreamSettings.load()
         controls = CameraControls.load()
         manualAddress = UserDefaults.standard.string(forKey: Self.manualAddressKey) ?? ""
+        profiles = CameraProfile.loadAll()
+        engine.updateProfiles(profiles)
 
         engine.statusHandler = { [weak self] status in
             Task { @MainActor in self?.handle(status) }
@@ -125,17 +122,29 @@ final class CameraViewModel: ObservableObject {
     /// Not streaming and not trying to: the computer can be chosen.
     var isIdle: Bool { !isConnectedOrConnecting }
 
-    var livePhase: LivePhase {
-        switch status {
-        case .idle, .failed: .idle
-        case .connecting: .waiting
-        case .streaming: .live
-        }
+    var isLive: Bool {
+        if case .streaming = status { return true }
+        return false
     }
 
     var isManualTarget: Bool { selectedTargetID == Self.manualTargetID }
 
-    private var selectedHost: OBSHost? { hosts.first { $0.id == selectedTargetID } }
+    var selectedHost: OBSHost? { hosts.first { $0.id == selectedTargetID } }
+
+    var isStreamingViaUSB: Bool {
+        if case .streaming(_, true) = status { return true }
+        return false
+    }
+
+    /// Cameras this iPhone has, plus the test pattern.
+    var availableSources: [VideoSourceKind] {
+        VideoSourceKind.allCases.filter { $0 == .testPattern || CameraCaptureService.isAvailable(for: $0) }
+    }
+
+    /// The profile that matches the current setup, if any.
+    var activeProfileID: UUID? {
+        profiles.first { $0.matches(settings: settings, controls: controls) }?.id
+    }
 
     var canConnectManually: Bool { OBSHost.manual(manualAddress) != nil }
 
@@ -150,87 +159,62 @@ final class CameraViewModel: ObservableObject {
         effectiveSource == .testPattern || CameraCaptureService.supportsFormat(for: settings)
     }
 
-    /// Shown under the carousel while streaming.
-    var activeTargetLabel: String {
+    /// First line of the connection status at the bottom.
+    var connectionTitle: String {
         switch status {
-        case .connecting(let host): host.uppercased()
-        case .streaming(_, true): "USB-КАБЕЛЬ"
-        case .streaming(let host, false): host.uppercased()
-        case .idle, .failed: ""
-        }
-    }
-
-    var statusTitle: String {
-        switch status {
-        case .idle: "Не в эфире"
-        case .connecting: "Подключение…"
-        case .streaming: "В эфире"
-        case .failed: "Нет связи с OBS"
-        }
-    }
-
-    /// Second line of the status pill.
-    var statsText: String? {
-        switch status {
-        case .connecting:
-            return reconnectError
-        case .streaming(let host, let viaUSB):
-            let size = settings.outputSize
-            let mbps = String(format: "%.1f", Double(stats.kilobitsPerSecond) / 1000)
-            return "\(viaUSB ? "USB" : host) · \(size.width)×\(size.height) · \(stats.framesPerSecond) fps · \(mbps) Мбит/с"
+        case .streaming(_, true): return "USB-кабель"
+        case .streaming(let host, false): return "Wi‑Fi: \(host)"
+        case .connecting(let host): return "Подключение: \(host)"
         case .idle, .failed:
-            return nil
+            if isManualTarget {
+                return canConnectManually ? "IP: \(manualAddress)" : "IP-адрес не введён"
+            }
+            if let selectedHost { return "Wi‑Fi: \(selectedHost.name)" }
+            return hosts.isEmpty ? "Поиск OBS…" : "Выберите компьютер"
         }
     }
 
-    /// Hint under the live button.
-    var captionText: String {
+    /// Second line: what is going on and what to do.
+    var connectionDetail: String {
         switch status {
         case .streaming:
-            return "Нажмите, чтобы остановить"
-        case .connecting(let host):
-            return reconnectError == nil ? "Подключение к \(host)… Нажмите, чтобы отменить"
-                                         : "Ждём OBS. Нажмите, чтобы отменить"
+            let mbps = String(format: "%.1f", Double(stats.kilobitsPerSecond) / 1000).replacingOccurrences(of: ".", with: ",")
+            let quality = switch connectionQuality {
+            case .bad: "Связь плохая"
+            case .weak: "Связь нестабильная"
+            default: "Связь хорошая"
+            }
+            return "\(quality) · \(mbps) Мбит/с · \(stats.framesPerSecond) к/с"
+        case .connecting:
+            return reconnectError ?? "Нажмите «Стоп», чтобы отменить"
         case .failed(let reason):
             return Self.friendlyError(reason)
         case .idle:
             if isManualTarget {
-                return canConnectManually ? "Нажмите, чтобы выйти в эфир" : "Введите IP-адрес компьютера с OBS"
+                return canConnectManually ? "Нажмите «Старт»" : "Нажмите, чтобы ввести IP"
             }
-            if selectedHost != nil { return "Нажмите, чтобы выйти в эфир" }
+            if selectedHost != nil { return "OBS готов · нажмите, чтобы сменить" }
             if let discoveryError { return discoveryError }
-            if !isUSBListening { return "Нажмите, чтобы снова ждать OBS по кабелю" }
-            return "OBS не найден. Подключите iPhone кабелем или введите IP"
+            if !isUSBListening { return "USB ждёт до следующего «Старт»" }
+            return "Подключите кабель или введите IP"
         }
     }
 
-    /// Zoom bubbles: 0,5 (ultra-wide camera, if any), 1× and 2× of the main camera.
-    var lensOptions: [LensOption] {
-        let source = effectiveSource
-        guard source == .backCamera || source == .backUltraWide else { return [] }
-        var steps: [(id: String, source: VideoSourceKind, zoom: Double, factor: Double)] = []
-        if CameraCaptureService.isAvailable(for: .backUltraWide) {
-            steps.append(("0.5", .backUltraWide, 1, 0.5))
+    var connectionQuality: ConnectionQuality {
+        switch status {
+        case .streaming:
+            // Share of frames the network couldn't take in the last second.
+            let dropped = Double(stats.droppedFrames) / Double(max(stats.framesPerSecond, 1))
+            if dropped == 0 { return .good }
+            return dropped < 0.2 ? .weak : .bad
+        case .connecting:
+            return .weak
+        case .failed:
+            return .bad
+        case .idle:
+            let ready = isManualTarget ? canConnectManually : selectedHost != nil
+            return ready ? .good : .none
         }
-        steps.append(("1", .backCamera, 1, 1))
-        steps.append(("2", .backCamera, 2, 2))
-        // The ultra-wide camera's 1× is 0,5× of the main one.
-        let shown = source == .backUltraWide ? controls.zoom * 0.5 : controls.zoom
-        let selectedID = steps.last { $0.source == source && $0.zoom <= controls.zoom + 0.01 }?.id
-        return steps.map { step in
-            let isSelected = step.id == selectedID
-            return LensOption(id: step.id, source: step.source, zoom: step.zoom,
-                              label: Self.zoomLabel(isSelected ? shown : step.factor, withSign: isSelected),
-                              isSelected: isSelected)
-        }
-    }
-
-    private static func zoomLabel(_ value: Double, withSign: Bool) -> String {
-        let rounded = (value * 10).rounded() / 10
-        let text = rounded == rounded.rounded()
-            ? String(Int(rounded))
-            : String(format: "%.1f", rounded).replacingOccurrences(of: ".", with: ",")
-        return withSign ? text + "×" : text
     }
 
     // MARK: - Intents
@@ -238,7 +222,6 @@ final class CameraViewModel: ObservableObject {
     func onAppear() async {
         guard !didStart else { return }
         didStart = true
-        InterfaceOrientation.lock(to: settings.orientation)
         await requestCameraAccessIfNeeded()
         await requestMicrophoneAccessIfNeeded()
         engine.camera.apply(controls)
@@ -294,20 +277,6 @@ final class CameraViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Format (top bar)
-
-    func cycleResolution() {
-        let all = VideoResolution.allCases
-        let index = all.firstIndex(of: settings.resolution) ?? 0
-        settings.resolution = all[(index + 1) % all.count]
-    }
-
-    func cycleFrameRate() {
-        let all = StreamSettings.supportedFrameRates
-        let index = all.firstIndex(of: settings.frameRate) ?? 0
-        settings.frameRate = all[(index + 1) % all.count]
-    }
-
     // MARK: - Camera controls
 
     func flipCamera() {
@@ -316,12 +285,13 @@ final class CameraViewModel: ObservableObject {
         settings.source = next
     }
 
-    func selectLens(_ option: LensOption) {
-        guard !isRemoteControlled else { return }
-        if settings.source != option.source {
-            settings.source = option.source
-        }
-        controls.zoom = option.zoom
+    func selectSource(_ source: VideoSourceKind) {
+        guard source != settings.source else { return }
+        settings.source = source
+    }
+
+    func toggleMicrophone() {
+        settings.audioEnabled.toggle()
     }
 
     func toggleTorch() {
@@ -397,6 +367,49 @@ final class CameraViewModel: ObservableObject {
         var reset = CameraControls()
         reset.torch = controls.torch
         controls = reset
+    }
+
+    /// Back to automatic for one control (long press on its value).
+    func resetControl(_ kind: CameraControlKind) {
+        guard !isRemoteControlled else { return }
+        let defaults = CameraControls()
+        var updated = controls
+        switch kind {
+        case .zoom:
+            updated.zoom = defaults.zoom
+        case .focus:
+            updated.focusMode = .auto
+        case .exposure:
+            updated.exposureMode = .auto
+            updated.exposureBias = defaults.exposureBias
+        case .whiteBalance:
+            updated.whiteBalanceMode = .auto
+        }
+        controls = updated
+    }
+
+    // MARK: - Profiles
+
+    /// Saves the current setup (the torch is left out).
+    func saveProfile(named name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var saved = controls
+        saved.torch = false
+        profiles.append(CameraProfile(name: trimmed, settings: settings, controls: saved))
+    }
+
+    func applyProfile(_ profile: CameraProfile) {
+        settings = profile.settings
+        // Under OBS control the camera values stay OBS's (OBS has its own profile picker).
+        guard !isRemoteControlled else { return }
+        var applied = profile.controls
+        applied.torch = controls.torch
+        controls = applied
+    }
+
+    func deleteProfiles(at offsets: IndexSet) {
+        profiles.remove(atOffsets: offsets)
     }
 
     // MARK: - Black screen
@@ -509,7 +522,7 @@ final class CameraViewModel: ObservableObject {
         autoBlackTask?.cancel()
         guard DisplayOptions.autoBlackScreen else { return }
         autoBlackTask = Task { [weak self] in
-            try? await Task.sleep(for: Self.autoBlackDelay)
+            try? await Task.sleep(for: .seconds(Self.autoBlackSeconds))
             guard !Task.isCancelled, let self, case .streaming = self.status else { return }
             self.enterBlackScreen()
         }

@@ -1,60 +1,40 @@
 import SwiftUI
 
-/// One screen, laid out like the iPhone Camera app: a top bar, the preview,
-/// a row with the computers (or the camera controls), and the live button.
-/// The interface turns with the stream orientation (see `InterfaceOrientation`),
-/// so landscape puts the bars on the sides.
+/// One portrait screen: the preview fills it, a tool bar on top, the camera
+/// values over its bottom, and the connection, profiles, start/stop and settings
+/// at the very bottom. The interface never turns; a landscape stream shows as a
+/// wide frame (hold the iPhone with the charging port to the right).
 struct ContentView: View {
     @ObservedObject var viewModel: CameraViewModel
     @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.verticalSizeClass) private var verticalSizeClass
-    @State private var showsSettings = false
-    @State private var controlsOpen = false
+    @State private var sheet: Sheet?
     @State private var activeControl: CameraControlKind?
-    @FocusState private var addressFocused: Bool
+    /// The profiles sheet opens straight into "save current setup".
+    @State private var savesProfileOnOpen = false
     @AppStorage(DisplayOptions.showGridKey) private var showGrid = false
     @AppStorage(DisplayOptions.showLevelKey) private var showLevel = false
+    @AppStorage(DisplayOptions.autoBlackScreenKey) private var autoBlackScreen = true
 
-    private var isLandscape: Bool { verticalSizeClass == .compact }
+    private enum Sheet: String, Identifiable {
+        case connection, profiles, settings
+        var id: String { rawValue }
+    }
 
     private var isCameraPreview: Bool {
         viewModel.effectiveSource != .testPattern && !viewModel.cameraAccessDenied
     }
 
-    /// Bars run along the long edge in portrait, along the short edges in landscape.
-    private var barLayout: AnyLayout {
-        isLandscape ? AnyLayout(VStackLayout(spacing: 14)) : AnyLayout(HStackLayout(spacing: 14))
+    private var visibleControls: [CameraControlKind] {
+        CameraControlKind.allCases.filter { $0 != .zoom || viewModel.capabilities.maxZoom > viewModel.capabilities.minZoom }
     }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            if isLandscape {
-                HStack(spacing: 12) {
-                    topBar
-                        .padding(.vertical, 8)
-                    previewArea
-                    targetRow
-                        .frame(width: 112)
-                    bottomBar
-                        .padding(.vertical, 8)
-                }
-                .padding(.horizontal, 8)
-            } else {
-                VStack(spacing: 0) {
-                    topBar
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                    previewArea
-                    targetRow
-                        .frame(height: 56)
-                    bottomBar
-                        .padding(.horizontal, 32)
-                    caption
-                        .padding(.top, 6)
-                        .padding(.bottom, 4)
-                }
+            VStack(spacing: 0) {
+                previewArea
+                bottomBar
             }
 
             if viewModel.isScreenBlack {
@@ -63,74 +43,21 @@ struct ContentView: View {
         }
         .task { await viewModel.onAppear() }
         .onChange(of: scenePhase) { _, phase in viewModel.scenePhaseChanged(phase) }
-        .sheet(isPresented: $showsSettings) {
-            SettingsView(viewModel: viewModel)
-                .presentationDetents([.medium, .large])
+        .onChange(of: isCameraPreview) { _, isCamera in
+            if !isCamera { activeControl = nil }
         }
-    }
-
-    // MARK: - Top bar
-
-    private var topBar: some View {
-        barLayout {
-            if isCameraPreview && viewModel.capabilities.hasTorch {
-                circleButton(viewModel.controls.torch ? "flashlight.on.fill" : "flashlight.off.fill",
-                             label: viewModel.controls.torch ? "Выключить фонарик" : "Включить фонарик",
-                             isOn: viewModel.controls.torch, action: viewModel.toggleTorch)
-                    .disabled(viewModel.isRemoteControlled)
+        .sheet(item: $sheet) { sheet in
+            switch sheet {
+            case .connection:
+                ConnectionView(viewModel: viewModel)
+                    .presentationDetents([.medium, .large])
+            case .profiles:
+                ProfilesView(viewModel: viewModel, savesOnAppear: savesProfileOnOpen)
+                    .presentationDetents([.medium, .large])
+            case .settings:
+                SettingsView(viewModel: viewModel)
             }
-            circleButton("moon.fill", label: "Выключить экран", action: viewModel.enterBlackScreen)
-            Spacer(minLength: 0)
-            if isCameraPreview {
-                circleButton(controlsOpen ? "chevron.down" : "chevron.up",
-                             label: "Фокус, экспозиция, баланс белого", isOn: controlsOpen) {
-                    controlsOpen.toggle()
-                    activeControl = nil
-                }
-            }
-            Spacer(minLength: 0)
-            formatPill
         }
-    }
-
-    /// "1080p · 30": each part changes on tap, like "HD · 30" in the Camera app.
-    private var formatPill: some View {
-        let layout = isLandscape ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 0))
-        return layout {
-            Button(viewModel.settings.resolution.rawValue, action: viewModel.cycleResolution)
-                .frame(minWidth: 36, minHeight: 36)
-                .accessibilityLabel("Разрешение \(viewModel.settings.resolution.rawValue)")
-            if !isLandscape {
-                Text("·")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-            }
-            Button("\(viewModel.settings.frameRate)", action: viewModel.cycleFrameRate)
-                .frame(minWidth: 36, minHeight: 36)
-                .accessibilityLabel("\(viewModel.settings.frameRate) кадров в секунду")
-        }
-        .buttonStyle(.plain)
-        .font(.footnote.weight(.bold).monospacedDigit())
-        // Orange: this camera can't do it, a standard mode is used instead.
-        .foregroundStyle(viewModel.isFormatSupported ? Color.white : Color.orange)
-        .padding(.horizontal, 6)
-        .padding(.vertical, isLandscape ? 4 : 0)
-        .overlay(Capsule().stroke(Color.white.opacity(0.7), lineWidth: 1.5))
-    }
-
-    private func circleButton(_ systemImage: String, label: String, isOn: Bool = false,
-                              action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: 16, weight: .semibold))
-                .frame(width: 40, height: 40)
-                .foregroundStyle(isOn ? Color.black : Color.white)
-                .background(isOn ? Color.brand : Color.white.opacity(0.14), in: Circle())
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(label)
     }
 
     // MARK: - Preview
@@ -138,6 +65,7 @@ struct ContentView: View {
     private var previewArea: some View {
         ZStack {
             preview
+                .ignoresSafeArea(edges: .top)
 
             if isCameraPreview && !viewModel.isScreenBlack {
                 if showGrid {
@@ -148,19 +76,28 @@ struct ContentView: View {
                 }
             }
 
-            VStack(spacing: 8) {
-                VStack(spacing: 6) {
-                    StatusPill(title: viewModel.statusTitle, isLive: viewModel.livePhase == .live,
-                               isWaiting: viewModel.livePhase == .waiting,
-                               liveSince: viewModel.liveSince, detail: viewModel.statsText)
-                    if viewModel.isRemoteControlled {
-                        OBSControlBadge()
-                    }
-                }
+            VStack(spacing: 10) {
+                toolBar
+                badges
                 Spacer(minLength: 0)
-                previewBottom
+                if viewModel.settings.orientation == .landscape && viewModel.isIdle {
+                    landscapeHint
+                }
+                HStack {
+                    Spacer()
+                    lensMenu
+                }
+                .padding(.horizontal, 14)
+                if isCameraPreview {
+                    if let activeControl {
+                        CameraControlPanel(viewModel: viewModel, kind: activeControl)
+                            .frame(maxWidth: 420)
+                            .padding(.horizontal, 12)
+                    }
+                    controlRow
+                }
             }
-            .padding(12)
+            .padding(.bottom, 8)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
@@ -178,6 +115,7 @@ struct ContentView: View {
                               isMirrored: viewModel.settings.mirror,
                               isEnabled: !viewModel.isScreenBlack,
                               onTap: { devicePoint, viewPoint in
+                                  activeControl = nil
                                   viewModel.tapToFocus(devicePoint: devicePoint, previewPoint: viewPoint)
                               },
                               onPinch: { scale in viewModel.pinchZoom(scale: scale) })
@@ -189,261 +127,308 @@ struct ContentView: View {
         }
     }
 
-    /// Width / height of the video as shown on screen (the interface turns with it).
+    /// Width / height of the video on the (always portrait) screen.
     private var displayAspectRatio: CGFloat {
         let size = viewModel.settings.resolution.landscapeSize
         let landscape = CGFloat(size.width) / CGFloat(size.height)
         return viewModel.settings.orientation == .landscape ? landscape : 1 / landscape
     }
 
+    // MARK: - Top
+
+    private var toolBar: some View {
+        HStack(spacing: 0) {
+            toolButton("grid", label: showGrid ? "Скрыть сетку" : "Показать сетку", isOn: showGrid) {
+                showGrid.toggle()
+            }
+            toolButton("arrow.triangle.2.circlepath.camera", label: "Сменить камеру",
+                       action: viewModel.flipCamera)
+                .disabled(!isCameraPreview)
+            toolButton(viewModel.settings.audioEnabled ? "mic.fill" : "mic.slash",
+                       label: viewModel.settings.audioEnabled ? "Выключить звук" : "Включить звук",
+                       isOn: viewModel.settings.audioEnabled, action: viewModel.toggleMicrophone)
+            toolButton(viewModel.controls.torch ? "flashlight.on.fill" : "flashlight.off.fill",
+                       label: viewModel.controls.torch ? "Выключить фонарик" : "Включить фонарик",
+                       isOn: viewModel.controls.torch, action: viewModel.toggleTorch)
+                .disabled(!isCameraPreview || !viewModel.capabilities.hasTorch || viewModel.isRemoteControlled)
+            toolButton("moon.fill", label: "Выключить экран", action: viewModel.enterBlackScreen)
+        }
+        .frame(height: 52)
+        .background(Color.black.opacity(0.55).ignoresSafeArea(edges: .top))
+    }
+
+    private func toolButton(_ systemImage: String, label: String, isOn: Bool = false,
+                            action: @escaping () -> Void) -> some View {
+        ToolButton(systemImage: systemImage, isOn: isOn, action: action)
+            .accessibilityLabel(label)
+    }
+
+    /// Format menu when idle; live timer (and the OBS lock) while streaming.
     @ViewBuilder
-    private var previewBottom: some View {
-        if controlsOpen, isCameraPreview, let activeControl {
-            CameraControlPanel(viewModel: viewModel, kind: activeControl)
-                .frame(maxWidth: 420)
-        } else {
-            VStack(spacing: 10) {
-                if viewModel.isManualTarget && viewModel.isIdle && !controlsOpen {
-                    addressField
-                }
-                if isLandscape && viewModel.isIdle {
-                    caption
-                }
-                if !viewModel.lensOptions.isEmpty {
-                    zoomBubbles
-                }
+    private var badges: some View {
+        VStack(spacing: 6) {
+            if viewModel.isLive, let liveSince = viewModel.liveSince {
+                LiveTimer(since: liveSince,
+                          blackScreenIn: autoBlackScreen ? CameraViewModel.autoBlackSeconds : nil)
+            } else {
+                formatMenu
+            }
+            if viewModel.isRemoteControlled {
+                Label("Камерой управляет OBS", systemImage: "lock.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.brand)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.75), in: Capsule())
             }
         }
     }
 
-    private var addressField: some View {
-        TextField("IP, например 192.168.1.10", text: $viewModel.manualAddress)
-            .keyboardType(.numbersAndPunctuation)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .focused($addressFocused)
-            .submitLabel(.go)
-            .onSubmit(viewModel.goLive)
-            .padding(.horizontal, 12)
-            .frame(height: 44)
-            .background(Color.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.3)))
-            .frame(maxWidth: 360)
-    }
-
-    private var zoomBubbles: some View {
-        HStack(spacing: 6) {
-            ForEach(viewModel.lensOptions) { option in
-                Button {
-                    viewModel.selectLens(option)
-                } label: {
-                    Text(option.label)
-                        .font(.system(size: option.isSelected ? 13 : 11, weight: .bold))
-                        .foregroundStyle(option.isSelected ? Color.brand : Color.white)
-                        .frame(width: option.isSelected ? 44 : 36, height: option.isSelected ? 44 : 36)
-                        .background(Color.black.opacity(0.6), in: Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Зум \(option.label)")
-                .accessibilityAddTraits(option.isSelected ? .isSelected : [])
+    private var formatMenu: some View {
+        Menu {
+            Picker("Разрешение", selection: $viewModel.settings.resolution) {
+                ForEach(VideoResolution.allCases) { Text($0.rawValue).tag($0) }
             }
+            .pickerStyle(.inline)
+            Picker("Кадров в секунду", selection: $viewModel.settings.frameRate) {
+                ForEach(StreamSettings.supportedFrameRates, id: \.self) { Text("\($0) к/с").tag($0) }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Text("\(viewModel.settings.resolution.rawValue) · \(viewModel.settings.frameRate)")
+                .font(.subheadline.weight(.bold).monospacedDigit())
+                .foregroundStyle(Color.black)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                // Orange: this camera can't do it, a standard mode is used instead.
+                .background(viewModel.isFormatSupported ? Color.brand : Color.orange,
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .frame(minHeight: 44)
         }
-        .padding(4)
-        .background(Color.black.opacity(0.35), in: Capsule())
-        .disabled(viewModel.isRemoteControlled)
+        .accessibilityLabel("Формат: \(viewModel.settings.resolution.rawValue), \(viewModel.settings.frameRate) кадров в секунду")
     }
 
-    // MARK: - Computers / camera controls
+    private var landscapeHint: some View {
+        Label("Держите iPhone горизонтально, разъёмом зарядки вправо", systemImage: "iphone.landscape")
+            .font(.caption)
+            .foregroundStyle(Color.white.opacity(0.85))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
 
-    @ViewBuilder
-    private var targetRow: some View {
-        if controlsOpen && isCameraPreview {
-            scrollRow(spacing: 8) {
-                ForEach(CameraControlKind.allCases) { kind in
-                    ControlChip(kind: kind, value: kind.value(of: viewModel.controls),
+    // MARK: - Camera values
+
+    private var lensMenu: some View {
+        Menu {
+            Picker("Камера", selection: Binding(get: { viewModel.settings.source },
+                                                set: { viewModel.selectSource($0) })) {
+                ForEach(viewModel.availableSources) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Label(viewModel.settings.source.shortTitle, systemImage: "camera")
+                .font(.body.weight(.medium))
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 16)
+                .frame(height: 44)
+                .background(Color.black.opacity(0.7), in: Capsule())
+        }
+        .accessibilityLabel("Камера: \(viewModel.settings.source.title)")
+    }
+
+    private var controlRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(visibleControls) { kind in
+                    ControlChip(label: kind.chipLabel(of: viewModel.controls),
+                                isAdjusted: kind.isAdjusted(in: viewModel.controls),
                                 isSelected: activeControl == kind) {
                         activeControl = activeControl == kind ? nil : kind
                     }
+                    .accessibilityLabel("\(kind.title): \(kind.value(of: viewModel.controls))")
+                    .contextMenu { resetMenu(for: kind) }
                 }
             }
-        } else if viewModel.isIdle {
-            scrollRow(spacing: isLandscape ? 6 : 22) {
-                if viewModel.hosts.isEmpty {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("ПОИСК OBS")
-                    }
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                }
-                ForEach(viewModel.hosts) { host in
-                    targetButton(host.name.uppercased(), isSelected: viewModel.selectedTargetID == host.id) {
-                        viewModel.selectedTargetID = host.id
-                    }
-                }
-                targetButton("IP-АДРЕС", isSelected: viewModel.isManualTarget) {
-                    viewModel.selectedTargetID = CameraViewModel.manualTargetID
-                    addressFocused = true
-                }
-            }
-        } else {
-            Text(viewModel.activeTargetLabel)
-                .font(.subheadline.weight(.semibold))
-                .tracking(0.8)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-                .foregroundStyle(Color.brand)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.horizontal, 12)
+        }
+        .opacity(viewModel.isRemoteControlled ? 0.5 : 1)
+    }
+
+    @ViewBuilder
+    private func resetMenu(for kind: CameraControlKind) -> some View {
+        Button {
+            viewModel.resetControls()
+        } label: {
+            Label("Сбросить всё на авто", systemImage: "arrow.counterclockwise")
+        }
+        .disabled(viewModel.isRemoteControlled)
+        Button("Сбросить: \(kind.title.lowercased())") {
+            viewModel.resetControl(kind)
+        }
+        .disabled(viewModel.isRemoteControlled || !kind.isAdjusted(in: viewModel.controls))
+        Button {
+            savesProfileOnOpen = true
+            sheet = .profiles
+        } label: {
+            Label("Сохранить как профиль…", systemImage: "bookmark")
         }
     }
 
-    /// Scrolls when the items don't fit, centered when they do.
-    private func scrollRow<Content: View>(spacing: CGFloat, @ViewBuilder content: () -> Content) -> some View {
-        let layout = isLandscape ? AnyLayout(VStackLayout(spacing: spacing)) : AnyLayout(HStackLayout(spacing: spacing))
-        let items = layout { content() }
-        return GeometryReader { proxy in
-            ScrollView(isLandscape ? .vertical : .horizontal, showsIndicators: false) {
-                items
-                    .padding(isLandscape ? .vertical : .horizontal, 16)
-                    .frame(minWidth: isLandscape ? nil : proxy.size.width,
-                           minHeight: isLandscape ? proxy.size.height : nil)
-            }
-            .scrollBounceBehavior(.basedOnSize)
-        }
-    }
-
-    private func targetButton(_ title: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-                .tracking(0.8)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-                .foregroundStyle(isSelected ? Color.brand : Color.white)
-                .frame(minHeight: 44)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-
-    // MARK: - Bottom bar
+    // MARK: - Bottom
 
     private var bottomBar: some View {
-        barLayout {
+        HStack(spacing: 10) {
             Button {
-                showsSettings = true
+                sheet = .connection
             } label: {
-                Image(systemName: "slider.horizontal.3")
-                    .font(.title3)
-                    .foregroundStyle(Color.white)
-                    .frame(width: 52, height: 52)
-                    .background(Color.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                HStack(spacing: 10) {
+                    Image(systemName: viewModel.isStreamingViaUSB ? "cable.connector" : "wifi")
+                        .font(.title3)
+                        .frame(width: 28)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(viewModel.connectionTitle)
+                            .font(.body.weight(.medium))
+                            .lineLimit(1)
+                        HStack(spacing: 5) {
+                            if let color = qualityColor {
+                                Circle().fill(color).frame(width: 7, height: 7)
+                            }
+                            Text(viewModel.connectionDetail)
+                                .lineLimit(1)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(Color.white)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Дополнительные настройки")
+            .accessibilityHint("Выбрать компьютер")
 
-            Spacer(minLength: 0)
-
-            LiveButton(phase: viewModel.livePhase, action: viewModel.liveButtonTapped)
-                .disabled(!viewModel.canPressLiveButton)
-
-            Spacer(minLength: 0)
-
-            Button(action: viewModel.flipCamera) {
-                Image(systemName: "arrow.triangle.2.circlepath.camera")
+            Button {
+                savesProfileOnOpen = false
+                sheet = .profiles
+            } label: {
+                Image(systemName: viewModel.activeProfileID == nil ? "bookmark" : "bookmark.fill")
                     .font(.title3)
                     .foregroundStyle(Color.white)
-                    .frame(width: 52, height: 52)
-                    .background(Color.white.opacity(0.14), in: Circle())
+                    .frame(width: 40, height: 44)
             }
-            .buttonStyle(.plain)
-            .disabled(!isCameraPreview)
-            .opacity(isCameraPreview ? 1 : 0.4)
-            .accessibilityLabel("Сменить камеру")
+            .accessibilityLabel("Профили")
+
+            liveButton
+
+            Button {
+                sheet = .settings
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.title3)
+                    .foregroundStyle(Color.white)
+                    .frame(width: 40, height: 44)
+            }
+            .accessibilityLabel("Настройки")
         }
-        .frame(minWidth: isLandscape ? 96 : nil, minHeight: isLandscape ? nil : 100)
+        .padding(.leading, 16)
+        .padding(.trailing, 8)
+        .padding(.vertical, 8)
+        .background(Color.black)
     }
 
-    private var caption: some View {
-        Text(viewModel.captionText)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .multilineTextAlignment(.center)
-            .lineLimit(2)
-            .padding(.horizontal, 16)
-            .padding(.vertical, isLandscape ? 6 : 0)
-            .background(isLandscape ? Color.black.opacity(0.55) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    private var qualityColor: Color? {
+        switch viewModel.connectionQuality {
+        case .none: nil
+        case .good: .green
+        case .weak: .orange
+        case .bad: .red
+        }
+    }
+
+    private var liveButton: some View {
+        let idle = viewModel.isIdle
+        return Button(action: viewModel.liveButtonTapped) {
+            HStack(spacing: 8) {
+                if idle {
+                    Circle().frame(width: 10, height: 10)
+                } else {
+                    RoundedRectangle(cornerRadius: 2).frame(width: 10, height: 10)
+                }
+                Text(idle ? "Старт" : "Стоп")
+            }
+            .font(.body.weight(.bold))
+            .foregroundStyle(idle ? Color.black : Color.white)
+            .padding(.horizontal, 18)
+            .frame(height: 44)
+            .background(idle ? Color.brand : Color.red, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(!viewModel.canPressLiveButton)
+        .opacity(viewModel.canPressLiveButton ? 1 : 0.4)
+        .accessibilityLabel(idle ? "Начать эфир" : "Остановить эфир")
     }
 }
 
 // MARK: - Subviews
 
-/// "Не в эфире" / "Подключение…" / red timer while live, plus a details line.
-private struct StatusPill: View {
-    let title: String
-    let isLive: Bool
-    let isWaiting: Bool
-    let liveSince: Date?
-    let detail: String?
+/// Icon in the top bar; violet when its option is on, dimmed when unavailable.
+private struct ToolButton: View {
+    let systemImage: String
+    let isOn: Bool
+    let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: 7) {
-                Circle()
-                    .fill(isLive ? Color.white : (isWaiting ? Color.orange : Color.gray))
-                    .frame(width: 8, height: 8)
-                titleText
-            }
-            .font(.subheadline.weight(.semibold).monospacedDigit())
-            .foregroundStyle(Color.white)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 5)
-            .background(isLive ? Color.red : Color.black.opacity(0.55),
-                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-
-            if let detail {
-                Text(detail)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(Color.white.opacity(0.85))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 3)
-                    .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            }
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 20, weight: .medium))
+                .foregroundStyle(isOn ? Color.brand : Color.white)
+                .opacity(isEnabled ? 1 : 0.35)
+                .frame(maxWidth: .infinity, minHeight: 52)
+                .contentShape(Rectangle())
         }
-    }
-
-    @ViewBuilder
-    private var titleText: some View {
-        if isLive, let liveSince {
-            TimelineView(.periodic(from: liveSince, by: 1)) { context in
-                Text(Self.elapsed(from: liveSince, to: context.date))
-            }
-            .accessibilityLabel(title)
-        } else {
-            Text(title)
-        }
-    }
-
-    private static func elapsed(from start: Date, to now: Date) -> String {
-        let seconds = max(0, Int(now.timeIntervalSince(start)))
-        let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60)
-        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
+        .buttonStyle(.plain)
     }
 }
 
-private struct OBSControlBadge: View {
+/// Red "12:47" while live, plus a countdown to the automatic black screen.
+private struct LiveTimer: View {
+    let since: Date
+    /// Seconds after going live when the screen turns black; nil if that is off.
+    let blackScreenIn: Int?
+
     var body: some View {
-        Label("Камерой управляет OBS", systemImage: "lock.fill")
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(Color.brand)
-            .padding(.horizontal, 11)
-            .padding(.vertical, 5)
-            .background(Color.black.opacity(0.6), in: Capsule())
+        TimelineView(.periodic(from: since, by: 1)) { context in
+            let seconds = max(0, Int(context.date.timeIntervalSince(since)))
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    Circle().fill(Color.white).frame(width: 8, height: 8)
+                    Text(Self.elapsed(seconds))
+                }
+                .font(.system(size: 15, weight: .medium, design: .monospaced))
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(Color.red, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .accessibilityLabel("В эфире \(Self.elapsed(seconds))")
+
+                if let blackScreenIn, seconds < blackScreenIn {
+                    Text("Экран погаснет через \(blackScreenIn - seconds) с")
+                        .font(.caption)
+                        .foregroundStyle(Color.white.opacity(0.9))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+            }
+        }
+    }
+
+    private static func elapsed(_ seconds: Int) -> String {
+        let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60)
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
     }
 }
 

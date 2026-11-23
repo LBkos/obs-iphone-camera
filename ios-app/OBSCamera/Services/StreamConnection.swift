@@ -18,6 +18,8 @@ final class StreamConnection: @unchecked Sendable {
     var keyframeNeededHandler: (() -> Void)?
     /// Called for every sent byte count (for statistics).
     var bytesSentHandler: ((Int) -> Void)?
+    /// Called for every frame dropped because the network can't keep up (for statistics).
+    var frameDroppedHandler: (() -> Void)?
     /// Camera controls from OBS (nil = OBS gave control back), on the connection queue.
     var controlsHandler: ((CameraControls?) -> Void)?
 
@@ -82,10 +84,14 @@ final class StreamConnection: @unchecked Sendable {
                     droppingUntilKeyframe = true
                     keyframeNeededHandler?()
                 }
+                frameDroppedHandler?()
                 return
             }
             if droppingUntilKeyframe {
-                guard frame.isKeyframe else { return }
+                guard frame.isKeyframe else {
+                    frameDroppedHandler?()
+                    return
+                }
                 droppingUntilKeyframe = false
             }
 
@@ -100,10 +106,10 @@ final class StreamConnection: @unchecked Sendable {
         }
     }
 
-    func sendCapabilities(_ caps: CameraCapabilities) {
+    func sendCapabilities(_ caps: CameraCapabilities, profiles: [CameraProfile]) {
         queue.async { [self] in
             guard isReady else { return }
-            write(WireProtocol.capabilitiesMessage(caps))
+            write(WireProtocol.capabilitiesMessage(caps, profiles: profiles))
         }
     }
 

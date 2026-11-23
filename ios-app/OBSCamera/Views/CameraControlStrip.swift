@@ -1,8 +1,10 @@
 import SwiftUI
 
-/// Focus, exposure and white balance: chips under the preview (opened with ^),
-/// the selected one shows its controls over the preview.
+/// Zoom, focus, exposure and white balance: a row of values over the bottom of
+/// the preview. Tapping one opens its controls above the row; a long press
+/// offers to reset it (or everything) to auto.
 enum CameraControlKind: String, CaseIterable, Identifiable {
+    case zoom
     case focus
     case exposure
     case whiteBalance
@@ -11,22 +13,17 @@ enum CameraControlKind: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .zoom: "Зум"
         case .focus: "Фокус"
         case .exposure: "Экспозиция"
         case .whiteBalance: "Баланс белого"
         }
     }
 
-    var chipTitle: String {
-        switch self {
-        case .focus: "ФОКУС"
-        case .exposure: "ЭКСПОЗИЦИЯ"
-        case .whiteBalance: "БАЛАНС"
-        }
-    }
-
     func value(of controls: CameraControls) -> String {
         switch self {
+        case .zoom:
+            String(format: "%.1f×", controls.zoom)
         case .focus:
             controls.focusMode == .manual ? String(format: "%.2f", controls.lensPosition) : controls.focusMode.title
         case .exposure:
@@ -39,32 +36,67 @@ enum CameraControlKind: String, CaseIterable, Identifiable {
             controls.whiteBalanceMode == .manual ? "\(Int(controls.temperature)) K" : controls.whiteBalanceMode.title
         }
     }
+
+    /// Short text on the chip: "Зум 1.0", "EV +0.3", "ISO 400 · 1/60", "ББ 5000K".
+    func chipLabel(of controls: CameraControls) -> String {
+        switch self {
+        case .zoom:
+            String(format: "Зум %.1f", controls.zoom)
+        case .focus:
+            controls.focusMode == .manual ? String(format: "Фокус %.2f", controls.lensPosition)
+                                          : "Фокус \(controls.focusMode.title.lowercased())"
+        case .exposure:
+            switch controls.exposureMode {
+            case .auto: String(format: "EV %+.1f", controls.exposureBias)
+            case .locked: "Эксп. фикс."
+            case .manual: "ISO \(Int(controls.iso)) · 1/\(controls.shutterDenominator)"
+            }
+        case .whiteBalance:
+            controls.whiteBalanceMode == .manual ? "ББ \(Int(controls.temperature))K"
+                                                 : "ББ \(controls.whiteBalanceMode.title.lowercased())"
+        }
+    }
+
+    /// Not automatic: the chip's dot is filled.
+    func isAdjusted(in controls: CameraControls) -> Bool {
+        switch self {
+        case .zoom: abs(controls.zoom - 1) > 0.01
+        case .focus: controls.focusMode != .auto
+        case .exposure: controls.exposureMode != .auto || abs(controls.exposureBias) > 0.05
+        case .whiteBalance: controls.whiteBalanceMode != .auto
+        }
+    }
 }
 
+/// One value in the row. Empty dot: automatic; filled: set by hand.
 struct ControlChip: View {
-    let kind: CameraControlKind
-    let value: String
+    let label: String
+    let isAdjusted: Bool
     let isSelected: Bool
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 1) {
-                Text(kind.chipTitle)
-                    .font(.system(size: 10, weight: .semibold))
-                    .opacity(0.85)
-                Text(value)
-                    .font(.footnote.weight(.bold).monospacedDigit())
+            HStack(spacing: 6) {
+                Circle()
+                    .strokeBorder(isSelected ? Color.black : Color.white, lineWidth: 1.5)
+                    .background(Circle().fill(isAdjusted ? (isSelected ? Color.black : Color.brand) : Color.clear))
+                    .frame(width: 10, height: 10)
+                Text(label)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.7)
             }
-            .padding(.horizontal, 8)
-            .frame(width: 104, height: 44)
+            .font(.system(size: 14, weight: .medium, design: .monospaced))
+            .padding(.horizontal, 10)
+            .frame(height: 40)
             .foregroundStyle(isSelected ? Color.black : Color.white)
-            .background(isSelected ? Color.brand : Color.white.opacity(0.12), in: Capsule())
+            .background(isSelected ? Color.brand : Color.black.opacity(0.6),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(isAdjusted && !isSelected ? Color.brand : Color.white.opacity(0.85), lineWidth: 1.5))
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(kind.title): \(value)")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
@@ -100,6 +132,24 @@ struct CameraControlPanel: View {
     @ViewBuilder
     private var content: some View {
         switch kind {
+        case .zoom:
+            if caps.maxZoom > caps.minZoom {
+                VStack(spacing: 2) {
+                    Slider(value: $viewModel.controls.zoom, in: caps.minZoom...caps.maxZoom, step: 0.1)
+                        .tint(Color.brand)
+                    HStack {
+                        Text(String(format: "%.0f×", caps.minZoom))
+                        Spacer()
+                        Text(String(format: "%.0f×", caps.maxZoom))
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+            } else {
+                Text("У этой камеры нет зума. Сменить камеру: кнопка справа.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         case .focus:
             modePicker(selection: Binding(get: { viewModel.controls.focusMode }, set: { viewModel.setFocusMode($0) }),
                        lock: caps.supportsFocusLock, manual: caps.supportsManualFocus)

@@ -52,8 +52,16 @@ enum WireProtocol {
 
     /// The plugin parses JSON with obs_data, which skips plain numbers inside
     /// arrays, so shutter speeds go as `{"value": n}` objects.
-    static func capabilitiesMessage(_ caps: CameraCapabilities) -> Data {
+    /// `profiles`: `{"id", "name", "controls"}`, controls with the same keys as a
+    /// `controls` message (no torch). OBS applies only these camera values, never
+    /// the format or encoding, so picking a profile there doesn't restart the video.
+    static func capabilitiesMessage(_ caps: CameraCapabilities, profiles: [CameraProfile]) -> Data {
         let json: [String: Any] = [
+            "profiles": profiles.map { profile -> [String: Any] in
+                let controls = (try? JSONEncoder().encode(profile.controls))
+                    .flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? [String: Any]()
+                return ["id": profile.id.uuidString, "name": profile.name, "controls": controls]
+            },
             "minZoom": caps.minZoom,
             "maxZoom": caps.maxZoom,
             "supportsFocusLock": caps.supportsFocusLock,
