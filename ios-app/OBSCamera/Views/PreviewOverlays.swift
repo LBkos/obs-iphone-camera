@@ -45,15 +45,15 @@ struct LevelOverlay: View {
         Group {
             if let roll = monitor.roll {
                 // Level when the screen's "down" points straight down: 0° in portrait,
-                // -90° held sideways (charging port to the right). The interface turns
-                // with the stream orientation, so the target is "flat" on screen.
+                // -90° held sideways (charging port to the right). The interface
+                // stays portrait, so the line follows the real horizon on screen.
                 let target = orientation == .portrait ? 0 : -Double.pi / 2
                 let isLevel = abs(roll - target) < 1 * .pi / 180
                 Capsule()
                     .fill(isLevel ? Color.green : Color.white.opacity(0.8))
                     .frame(width: 160, height: 3)
                     // The line stays parallel to the real horizon.
-                    .rotationEffect(.radians(-(roll - target)))
+                    .rotationEffect(.radians(-roll))
                     .animation(.linear(duration: 0.1), value: roll)
             }
         }

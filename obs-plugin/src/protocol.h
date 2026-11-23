@@ -24,6 +24,9 @@
  *                  Fields as in CameraCapabilities (Swift); shutterDenominators
  *                  is an array of {"value": n} objects (shutter 1/n s), since
  *                  obs_data can't read arrays of plain numbers.
+ *                  "profiles": the app's saved profiles, [{"id", "name",
+ *                  "controls"}], controls with the CONTROLS keys (no torch).
+ *                  Also re-sent whenever the profiles change.
  *   CONTROLS (0x08)  OBS -> iPhone. payload: UTF-8 JSON with the camera controls
  *                  (zoom, focusMode, lensPosition, exposureMode, exposureBias,
  *                  iso, shutterDenominator, whiteBalanceMode, temperature,
